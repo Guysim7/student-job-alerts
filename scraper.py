@@ -52,6 +52,10 @@ NVIDIA_WORKDAY_URL = "https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDI
 NVIDIA_WORKDAY_BASE_URL = "https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite"
 NVIDIA_ISRAEL_ID = "2fcb99c455831013ea52bbe14cf9326c"
 
+# Microsoft careers API — discovered by intercepting XHR calls on the careers page.
+MICROSOFT_SEARCH_URL = "https://apply.careers.microsoft.com/api/pcsx/search"
+MICROSOFT_BASE_URL = "https://jobs.careers.microsoft.com"
+
 
 # ── Data model ───────────────────────────────────────────────────────────────
 
@@ -103,6 +107,11 @@ class Job:
             match = re.search(r"(\d+)\+?\s+days?\s+ago", text, re.IGNORECASE)
             if match:
                 return int(match.group(1))
+
+        # Unix timestamp (Microsoft)
+        if text.isdigit():
+            posted_date = datetime.fromtimestamp(int(text))
+            return (datetime.now() - posted_date).days
 
         # Standard date formats
         for fmt in ("%B %d, %Y", "%Y-%m-%d"):
@@ -189,6 +198,62 @@ def fetch_amazon_jobs() -> list[Job]:
         )
         # Only keep student roles based in Israel
         if job.is_student_role() and job.is_in_israel():
+            jobs.append(job)
+
+    return jobs
+
+
+def fetch_microsoft_jobs() -> list[Job]:
+    """
+    Fetch student / intern job postings from Microsoft's careers API.
+
+    Microsoft's careers site (jobs.careers.microsoft.com) loads job data via
+    an internal API at apply.careers.microsoft.com. This endpoint was discovered
+    by intercepting XHR network calls on the careers page using Playwright.
+
+    The API supports filtering by query keyword and location directly in the URL,
+    returning a JSON object with a 'data.positions' list. The 'postedTs' field
+    is a Unix timestamp.
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    params = {
+        "domain": "microsoft.com",
+        "query": "intern",
+        "location": "Israel",
+        "start": "0",
+        "num": "50",
+    }
+
+    try:
+        response = requests.get(
+            MICROSOFT_SEARCH_URL,
+            params=params,
+            impersonate="chrome",
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[Microsoft] Request failed: {e}")
+        return []
+
+    positions = response.json().get("data", {}).get("positions", [])
+    jobs = []
+
+    for item in positions:
+        # Locations is a list — join them for display
+        location = ", ".join(item.get("locations", []))
+
+        job = Job(
+            job_id   = f"microsoft_{item.get('id', '')}",
+            title    = item.get("name", ""),
+            company  = "Microsoft",
+            location = location,
+            url      = MICROSOFT_BASE_URL + item.get("positionUrl", ""),
+            posted   = datetime.fromtimestamp(item["postedTs"]).strftime("%B %d, %Y") if item.get("postedTs") else "",
+        )
+        if job.is_student_role():
             jobs.append(job)
 
     return jobs
@@ -372,11 +437,11 @@ def run_all_scrapers() -> list[Job]:
     all_jobs = []
     scrapers = [
         fetch_amazon_jobs,
-        # fetch_nvidia_jobs,     # TODO: Cloudflare bot protection blocks reliable scraping
-        # fetch_microsoft_jobs,  # coming soon
-        # fetch_google_jobs,     # coming soon
-        # fetch_meta_jobs,       # coming soon
-        # fetch_apple_jobs,      # coming soon
+        fetch_microsoft_jobs,
+        # fetch_nvidia_jobs,   # TODO: Cloudflare bot protection blocks reliable scraping
+        # fetch_google_jobs,   # TODO: blocks headless browsers, protobuf API
+        # fetch_meta_jobs,     # TODO: very few Israel intern jobs, requires Playwright session
+        # fetch_apple_jobs,    # TODO: no accessible API found yet
     ]
 
     for scraper in scrapers:

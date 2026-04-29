@@ -38,6 +38,27 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Keywords used to filter job titles for student-relevant roles.
 STUDENT_KEYWORDS = ["intern", "internship", "new grad", "entry level", "student"]
 
+# Jobs whose titles contain any of these are excluded — they target PhD/MSc candidates,
+# not BSc students.
+DEGREE_EXCLUDE_KEYWORDS = [
+    "phd", "ph.d", "doctorate", "doctoral",
+    "msc", "m.sc", "masters", "master's", "master ",
+    "postdoc", "post-doc", "post doc",
+    "research scientist",  # almost always requires a PhD
+]
+
+# Jobs must contain at least one of these to be considered CS-relevant.
+# This filters out unrelated intern roles (HR, marketing, finance, legal, etc.).
+CS_KEYWORDS = [
+    "software", "engineer", "developer", "programming",
+    "data", "machine learning", "ml", "ai", "artificial intelligence",
+    "security", "cyber", "network", "systems", "infrastructure",
+    "backend", "frontend", "full stack", "fullstack", "web",
+    "algorithm", "computer", "cloud", "devops", "platform",
+    "research intern",  # keep research internships (often CS-relevant)
+    "product",          # product roles can be relevant for CS students
+]
+
 # Only jobs located in Israel will be reported.
 ISRAEL_KEYWORDS = ["israel", "tel aviv", "tel-aviv", "haifa", "jerusalem", "herzliya", "beer sheva", "il,"]
 
@@ -88,6 +109,20 @@ class Job:
         """Return True if the job location is in Israel."""
         location_lower = self.location.lower()
         return any(kw in location_lower for kw in ISRAEL_KEYWORDS)
+
+    def is_bsc_level(self) -> bool:
+        """
+        Return True if the job is appropriate for a BSc student.
+
+        Excludes roles that explicitly require a PhD or Master's degree,
+        and roles in unrelated fields (HR, marketing, finance, etc.).
+        """
+        title_lower = self.title.lower()
+        # Reject PhD / MSc roles
+        if any(kw in title_lower for kw in DEGREE_EXCLUDE_KEYWORDS):
+            return False
+        # Keep only CS-relevant roles
+        return any(kw in title_lower for kw in CS_KEYWORDS)
 
     def age_in_days(self) -> int | None:
         """
@@ -196,8 +231,8 @@ def fetch_amazon_jobs() -> list[Job]:
             url      = AMAZON_BASE_URL + item.get("job_path", ""),
             posted   = item.get("posted_date", ""),
         )
-        # Only keep student roles based in Israel
-        if job.is_student_role() and job.is_in_israel():
+        # Only keep BSc CS-relevant student roles based in Israel
+        if job.is_student_role() and job.is_in_israel() and job.is_bsc_level():
             jobs.append(job)
 
     return jobs
@@ -253,7 +288,7 @@ def fetch_microsoft_jobs() -> list[Job]:
             url      = MICROSOFT_BASE_URL + item.get("positionUrl", ""),
             posted   = datetime.fromtimestamp(item["postedTs"]).strftime("%B %d, %Y") if item.get("postedTs") else "",
         )
-        if job.is_student_role():
+        if job.is_student_role() and job.is_bsc_level():
             jobs.append(job)
 
     return jobs

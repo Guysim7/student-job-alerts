@@ -20,6 +20,7 @@ Usage:
 
 import json
 import os
+from datetime import datetime
 import requests
 from dotenv import load_dotenv
 
@@ -33,6 +34,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # Keywords used to filter job titles for student-relevant roles.
 STUDENT_KEYWORDS = ["intern", "internship", "new grad", "entry level", "student"]
+
+# Only jobs located in Israel will be reported.
+ISRAEL_KEYWORDS = ["israel", "tel aviv", "tel-aviv", "haifa", "jerusalem", "herzliya", "beer sheva", "il,"]
 
 # File that persists job IDs we've already seen across runs.
 SEEN_JOBS_FILE = "seen_jobs.json"
@@ -67,6 +71,49 @@ class Job:
         """Return True if the job title contains any student-relevant keyword."""
         title_lower = self.title.lower()
         return any(kw in title_lower for kw in STUDENT_KEYWORDS)
+
+    def is_in_israel(self) -> bool:
+        """Return True if the job location is in Israel."""
+        location_lower = self.location.lower()
+        return any(kw in location_lower for kw in ISRAEL_KEYWORDS)
+
+    def age_in_days(self) -> int | None:
+        """
+        Return how many days ago the job was posted, or None if unparseable.
+
+        Tries two common date formats returned by job APIs:
+          - 'November  4, 2025'  (Amazon's format)
+          - '2025-11-04'         (ISO format, for future scrapers)
+        """
+        for fmt in ("%B %d, %Y", "%Y-%m-%d"):
+            try:
+                posted_date = datetime.strptime(self.posted.strip(), fmt)
+                return (datetime.now() - posted_date).days
+            except ValueError:
+                continue
+        return None
+
+    def freshness_indicator(self) -> tuple[str, str]:
+        """
+        Return a color label based on how old the posting is.
+
+        Rules:
+          < 7 days  → green  (fresh)
+          7-14 days → yellow (getting old)
+          > 14 days → red    (stale)
+
+        Returns:
+            A tuple of (terminal_color_code, emoji) for use in output.
+            Terminal uses ANSI escape codes; Telegram uses colored circle emojis.
+        """
+        days = self.age_in_days()
+        if days is None:
+            return ("\033[0m", "⚪")   # unknown — no color
+        if days < 7:
+            return ("\033[92m", "🟢")  # green
+        if days < 14:
+            return ("\033[93m", "🟡")  # yellow
+        return ("\033[91m", "🔴")      # red
 
     def __repr__(self) -> str:
         return f"Job({self.company} | {self.title} | {self.location})"
@@ -119,8 +166,8 @@ def fetch_amazon_jobs() -> list[Job]:
             url      = AMAZON_BASE_URL + item.get("job_path", ""),
             posted   = item.get("posted_date", ""),
         )
-        # Only keep roles relevant to students
-        if job.is_student_role():
+        # Only keep student roles based in Israel
+        if job.is_student_role() and job.is_in_israel():
             jobs.append(job)
 
     return jobs
@@ -196,21 +243,27 @@ def notify_new_jobs(new_jobs: list[Job]) -> None:
     print(f"  {len(new_jobs)} NEW STUDENT JOB(S) FOUND")
     print(f"{'='*60}\n")
 
+    RESET = "\033[0m"
+
     for job in new_jobs:
-        # Terminal output
+        color, emoji = job.freshness_indicator()
+        days         = job.age_in_days()
+        age_label    = f"{days} days ago" if days is not None else "unknown date"
+
+        # Terminal output — job title is colored by freshness
         print(f"  Company  : {job.company}")
-        print(f"  Title    : {job.title}")
+        print(f"  Title    : {color}{job.title}{RESET}")
         print(f"  Location : {job.location}")
-        print(f"  Posted   : {job.posted}")
+        print(f"  Posted   : {color}{job.posted} ({age_label}){RESET}")
         print(f"  Link     : {job.url}")
         print(f"  {'-'*56}")
 
-        # Telegram message — one per job for clear phone notifications
+        # Telegram message — uses colored circle emoji since Telegram has no text colors
         message = (
             f"🎓 <b>New Student Role at {job.company}</b>\n\n"
             f"<b>{job.title}</b>\n"
             f"📍 {job.location}\n"
-            f"📅 Posted: {job.posted}\n\n"
+            f"📅 Posted: {job.posted} {emoji} <i>({age_label})</i>\n\n"
             f"🔗 <a href=\"{job.url}\">View Job</a>"
         )
         send_telegram_message(message)

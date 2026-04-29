@@ -77,6 +77,11 @@ NVIDIA_ISRAEL_ID = "2fcb99c455831013ea52bbe14cf9326c"
 MICROSOFT_SEARCH_URL = "https://apply.careers.microsoft.com/api/pcsx/search"
 MICROSOFT_BASE_URL = "https://jobs.careers.microsoft.com"
 
+# Apple careers — SSR page with job data embedded in window.__staticRouterHydrationData.
+# Location code for Israel is "israel-ISR"; keyword search filters all job text.
+APPLE_SEARCH_URL = "https://jobs.apple.com/en-us/search?location=israel-ISR&search=intern"
+APPLE_BASE_URL   = "https://jobs.apple.com/en-us/details"
+
 
 # ── Data model ───────────────────────────────────────────────────────────────
 
@@ -151,7 +156,7 @@ class Job:
             return (datetime.now() - posted_date).days
 
         # Standard date formats
-        for fmt in ("%B %d, %Y", "%Y-%m-%d"):
+        for fmt in ("%B %d, %Y", "%b %d, %Y", "%Y-%m-%d"):
             try:
                 posted_date = datetime.strptime(text, fmt)
                 return (datetime.now() - posted_date).days
@@ -285,7 +290,8 @@ def _fetch_microsoft_summary(position_id: int) -> tuple[str, str]:
         public_url = data.get("publicUrl", "")
         return summary, public_url
 
-    except Exception:
+    except Exception as e:
+        print(f"[Microsoft] Summary fetch failed for {position_id}: {e}")
         return "", ""
 
 
@@ -450,6 +456,39 @@ def save_seen_jobs(seen: set[str]) -> None:
 
 # ── Notifications ────────────────────────────────────────────────────────────
 
+def _format_bullets(summary: str, max_bullets: int = 4, max_len: int = 80) -> str:
+    """
+    Convert a raw qualifications string into a short bullet-point list.
+
+    Splits on common delimiters (hyphens, semicolons, newlines), takes the
+    first max_bullets non-empty items, and trims each to max_len characters.
+
+    Args:
+        summary:     Raw qualifications text.
+        max_bullets: Maximum number of bullet points to return.
+        max_len:     Maximum character length per bullet.
+
+    Returns:
+        A string of bullet points separated by newlines, e.g. "• ...\n• ..."
+    """
+    import re as _re
+
+    # Split on common list delimiters
+    parts = _re.split(r"\s*[-•]\s+|\n|;\s*", summary)
+    bullets = []
+    for part in parts:
+        part = part.strip()
+        # Skip very short fragments, headers like "Required Qualifications", etc.
+        if len(part) < 15 or part.lower() in ("required qualifications", "qualifications"):
+            continue
+        # Trim long items
+        trimmed = part[:max_len] + "…" if len(part) > max_len else part
+        bullets.append(f"• {trimmed}")
+        if len(bullets) >= max_bullets:
+            break
+
+    return "\n".join(bullets)
+
 def send_telegram_message(text: str) -> None:
     """
     Send a message to your Telegram chat via the bot.
@@ -509,15 +548,18 @@ def notify_new_jobs(new_jobs: list[Job]) -> None:
         print(f"  Link     : {job.url}")
         print(f"  {'-'*56}")
 
-        # Build summary block for Telegram — only shown if available
-        summary_block = f"\n\n📋 <b>Requirements:</b>\n<i>{job.summary[:400]}</i>" if job.summary else ""
+        # Build requirements block — formatted as bullet points
+        if job.summary:
+            bullets = _format_bullets(job.summary)
+            summary_block = f"\n\n📋 <b>Requirements:</b>\n{bullets}" if bullets else ""
+        else:
+            summary_block = ""
 
-        # Telegram message — uses colored circle emoji since Telegram has no text colors
+        # Telegram message — concise, bullet-formatted
         message = (
-            f"🎓 <b>New Student Role at {job.company}</b>\n\n"
-            f"<b>{job.title}</b>\n"
+            f"{emoji} <b>{job.company} — {job.title}</b>\n"
             f"📍 {job.location}\n"
-            f"📅 Posted: {job.posted} {emoji} <i>({age_label})</i>"
+            f"📅 {job.posted} <i>({age_label})</i>"
             f"{summary_block}\n\n"
             f"🔗 <a href=\"{job.url}\">View Job</a>"
         )

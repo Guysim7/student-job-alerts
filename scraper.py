@@ -83,7 +83,7 @@ MICROSOFT_BASE_URL = "https://jobs.careers.microsoft.com"
 class Job:
     """Represents a single job posting."""
 
-    def __init__(self, job_id: str, title: str, company: str, location: str, url: str, posted: str = ""):
+    def __init__(self, job_id: str, title: str, company: str, location: str, url: str, posted: str = "", summary: str = ""):
         """
         Args:
             job_id:   Unique identifier for the job (used to detect duplicates).
@@ -92,6 +92,7 @@ class Job:
             location: City / country of the role.
             url:      Direct link to the job posting.
             posted:   Date the job was posted, as a human-readable string.
+            summary:  Short summary of key requirements, shown in the notification.
         """
         self.job_id   = job_id
         self.title    = title
@@ -99,6 +100,7 @@ class Job:
         self.location = location
         self.url      = url
         self.posted   = posted
+        self.summary  = summary
 
     def is_student_role(self) -> bool:
         """Return True if the job title contains any student-relevant keyword."""
@@ -223,6 +225,13 @@ def fetch_amazon_jobs() -> list[Job]:
     jobs     = []
 
     for item in raw_jobs:
+        # Strip HTML tags from basic_qualifications and trim to a short summary
+        import re as _re
+        raw_quals = item.get("basic_qualifications", "")
+        clean_quals = _re.sub(r"<[^>]+>", " ", raw_quals)
+        clean_quals = _re.sub(r"\s+", " ", clean_quals).strip()
+        summary = clean_quals[:400] + "…" if len(clean_quals) > 400 else clean_quals
+
         job = Job(
             job_id   = str(item.get("id", "")),
             title    = item.get("title", ""),
@@ -230,12 +239,54 @@ def fetch_amazon_jobs() -> list[Job]:
             location = item.get("location", ""),
             url      = AMAZON_BASE_URL + item.get("job_path", ""),
             posted   = item.get("posted_date", ""),
+            summary  = summary,
         )
         # Only keep BSc CS-relevant student roles based in Israel
         if job.is_student_role() and job.is_in_israel() and job.is_bsc_level():
             jobs.append(job)
 
     return jobs
+
+
+def _fetch_microsoft_summary(position_id: int) -> tuple[str, str]:
+    """
+    Fetch the job description for a single Microsoft position and extract
+    the qualifications section as a short summary.
+
+    Also returns the public URL for the job listing, which is the correct
+    link to share (the search API returns an internal path that redirects
+    to the homepage instead of the job page).
+
+    Args:
+        position_id: The numeric job ID from the search results.
+
+    Returns:
+        A tuple of (summary, public_url). Both are empty strings on failure.
+    """
+    try:
+        r = requests.get(
+            f"https://apply.careers.microsoft.com/api/pcsx/position_details"
+            f"?position_id={position_id}&domain=microsoft.com&hl=en",
+            impersonate="chrome",
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json().get("data", {})
+
+        # Strip HTML tags from the job description
+        import re as _re
+        desc = _re.sub(r"<[^>]+>", " ", data.get("jobDescription", ""))
+        desc = _re.sub(r"\s+", " ", desc).strip()
+
+        # Extract from the "Qualifications" section onward
+        qual_idx = desc.lower().find("qualif")
+        summary = desc[qual_idx:qual_idx + 500] + "…" if qual_idx >= 0 else desc[:400] + "…"
+
+        public_url = data.get("publicUrl", "")
+        return summary, public_url
+
+    except Exception:
+        return "", ""
 
 
 def fetch_microsoft_jobs() -> list[Job]:
@@ -246,9 +297,10 @@ def fetch_microsoft_jobs() -> list[Job]:
     an internal API at apply.careers.microsoft.com. This endpoint was discovered
     by intercepting XHR network calls on the careers page using Playwright.
 
-    The API supports filtering by query keyword and location directly in the URL,
-    returning a JSON object with a 'data.positions' list. The 'postedTs' field
-    is a Unix timestamp.
+    For each matching job we fetch position_details to get:
+      - A qualifications summary for the Telegram notification.
+      - The correct public URL (the search API returns an internal path that
+        redirects to the homepage rather than the job page).
 
     Returns:
         A list of Job objects for student roles located in Israel.
@@ -277,18 +329,24 @@ def fetch_microsoft_jobs() -> list[Job]:
     jobs = []
 
     for item in positions:
-        # Locations is a list — join them for display
         location = ", ".join(item.get("locations", []))
+        position_id = item.get("id", "")
 
         job = Job(
-            job_id   = f"microsoft_{item.get('id', '')}",
+            job_id   = f"microsoft_{position_id}",
             title    = item.get("name", ""),
             company  = "Microsoft",
             location = location,
-            url      = MICROSOFT_BASE_URL + item.get("positionUrl", ""),
             posted   = datetime.fromtimestamp(item["postedTs"]).strftime("%B %d, %Y") if item.get("postedTs") else "",
+            url      = "",      # filled in below after fetching details
+            summary  = "",      # filled in below after fetching details
         )
+
         if job.is_student_role() and job.is_bsc_level():
+            # Fetch qualifications summary and correct public URL
+            summary, public_url = _fetch_microsoft_summary(position_id)
+            job.summary = summary
+            job.url = public_url or (MICROSOFT_BASE_URL + item.get("positionUrl", ""))
             jobs.append(job)
 
     return jobs
@@ -446,15 +504,21 @@ def notify_new_jobs(new_jobs: list[Job]) -> None:
         print(f"  Title    : {color}{job.title}{RESET}")
         print(f"  Location : {job.location}")
         print(f"  Posted   : {color}{job.posted} ({age_label}){RESET}")
+        if job.summary:
+            print(f"  Summary  : {job.summary[:200]}")
         print(f"  Link     : {job.url}")
         print(f"  {'-'*56}")
+
+        # Build summary block for Telegram — only shown if available
+        summary_block = f"\n\n📋 <b>Requirements:</b>\n<i>{job.summary[:400]}</i>" if job.summary else ""
 
         # Telegram message — uses colored circle emoji since Telegram has no text colors
         message = (
             f"🎓 <b>New Student Role at {job.company}</b>\n\n"
             f"<b>{job.title}</b>\n"
             f"📍 {job.location}\n"
-            f"📅 Posted: {job.posted} {emoji} <i>({age_label})</i>\n\n"
+            f"📅 Posted: {job.posted} {emoji} <i>({age_label})</i>"
+            f"{summary_block}\n\n"
             f"🔗 <a href=\"{job.url}\">View Job</a>"
         )
         send_telegram_message(message)

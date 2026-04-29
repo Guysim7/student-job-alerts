@@ -20,8 +20,11 @@ Usage:
 
 import json
 import os
+import time
 from datetime import datetime
-import requests
+# curl_cffi impersonates Chrome's TLS fingerprint, which bypasses Cloudflare bot
+# detection on sites like NVIDIA. It is API-compatible with the requests library.
+from curl_cffi import requests
 from dotenv import load_dotenv
 
 # Load TELEGRAM_TOKEN and TELEGRAM_CHAT_ID from the .env file
@@ -43,6 +46,11 @@ SEEN_JOBS_FILE = "seen_jobs.json"
 
 # Base URL used when building full links to Amazon job listings.
 AMAZON_BASE_URL = "https://www.amazon.jobs"
+
+# NVIDIA Workday API — base URL and Israel country filter ID.
+NVIDIA_WORKDAY_URL = "https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCareerSite/jobs"
+NVIDIA_WORKDAY_BASE_URL = "https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite"
+NVIDIA_ISRAEL_ID = "2fcb99c455831013ea52bbe14cf9326c"
 
 
 # ── Data model ───────────────────────────────────────────────────────────────
@@ -81,16 +89,29 @@ class Job:
         """
         Return how many days ago the job was posted, or None if unparseable.
 
-        Tries two common date formats returned by job APIs:
-          - 'November  4, 2025'  (Amazon's format)
-          - '2025-11-04'         (ISO format, for future scrapers)
+        Handles multiple formats returned by different job APIs:
+          - 'November  4, 2025'   (Amazon)
+          - '2025-11-04'          (ISO format, for future scrapers)
+          - 'Posted 3 Days Ago'   (NVIDIA / Workday)
+          - 'Posted 30+ Days Ago' (NVIDIA / Workday — treated as 30 days)
         """
+        text = self.posted.strip()
+
+        # Workday format: "Posted 3 Days Ago" or "Posted 30+ Days Ago"
+        if text.lower().startswith("posted"):
+            import re
+            match = re.search(r"(\d+)\+?\s+days?\s+ago", text, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+
+        # Standard date formats
         for fmt in ("%B %d, %Y", "%Y-%m-%d"):
             try:
-                posted_date = datetime.strptime(self.posted.strip(), fmt)
+                posted_date = datetime.strptime(text, fmt)
                 return (datetime.now() - posted_date).days
             except ValueError:
                 continue
+
         return None
 
     def freshness_indicator(self) -> tuple[str, str]:
@@ -147,9 +168,9 @@ def fetch_amazon_jobs() -> list[Job]:
     }
 
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10, impersonate="chrome")
         response.raise_for_status()
-    except requests.RequestException as e:
+    except Exception as e:
         print(f"[Amazon] Request failed: {e}")
         return []
 
@@ -168,6 +189,76 @@ def fetch_amazon_jobs() -> list[Job]:
         )
         # Only keep student roles based in Israel
         if job.is_student_role() and job.is_in_israel():
+            jobs.append(job)
+
+    return jobs
+
+
+def fetch_nvidia_jobs() -> list[Job]:
+    """
+    Fetch student / intern job postings from NVIDIA's Workday career portal.
+
+    NVIDIA uses Workday as their ATS. Workday requires a valid browser session
+    before accepting API calls — we first GET the careers page to obtain a
+    session cookie, then POST to the search API with the Israel facet filter.
+
+    The 'postedOn' field uses Workday's relative format ('Posted 3 Days Ago')
+    which is handled by Job.age_in_days().
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    session = requests.Session(impersonate="chrome")
+
+    try:
+        # Step 1: visit careers page to acquire a valid Workday session cookie
+        session.get("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite", timeout=10)
+        time.sleep(3)
+
+        # Step 2: POST to the search API — session cookie is sent automatically.
+        # Workday sometimes routes to a Calypso backend that requires the CSRF token
+        # as a request header (in addition to the cookie).
+        post_headers = {"Content-Type": "application/json"}
+        csrf_token = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
+        if csrf_token:
+            post_headers["X-Workday-Client-CSRF-Token"] = csrf_token
+
+        payload = {
+            "limit": 50,
+            "offset": 0,
+            "searchText": "intern",
+            "appliedFacets": {"locationHierarchy1": [NVIDIA_ISRAEL_ID]},
+        }
+        response = session.post(
+            NVIDIA_WORKDAY_URL,
+            json=payload,
+            headers=post_headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[NVIDIA] Request failed: {e}")
+        return []
+
+    data     = response.json()
+    raw_jobs = data.get("jobPostings", [])
+    jobs     = []
+
+    for item in raw_jobs:
+        # Build job ID from the external path (e.g. /job/Israel-Tel-Aviv/..._JR123456)
+        job_id = item.get("bulletFields", [""])[0] or item.get("externalPath", "")
+
+        job = Job(
+            job_id   = f"nvidia_{job_id}",
+            title    = item.get("title", ""),
+            company  = "NVIDIA",
+            location = item.get("locationsText", ""),
+            url      = NVIDIA_WORKDAY_BASE_URL + item.get("externalPath", ""),
+            posted   = item.get("postedOn", ""),
+        )
+        # Workday returns all Israel jobs matching "intern" in description;
+        # filter titles to ensure it's actually a student-facing role.
+        if job.is_student_role():
             jobs.append(job)
 
     return jobs
@@ -219,9 +310,9 @@ def send_telegram_message(text: str) -> None:
         "disable_web_page_preview": True,
     }
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10, impersonate="chrome")
         response.raise_for_status()
-    except requests.RequestException as e:
+    except Exception as e:
         print(f"[Telegram] Failed to send message: {e}")
 
 
@@ -281,6 +372,7 @@ def run_all_scrapers() -> list[Job]:
     all_jobs = []
     scrapers = [
         fetch_amazon_jobs,
+        # fetch_nvidia_jobs,     # TODO: Cloudflare bot protection blocks reliable scraping
         # fetch_microsoft_jobs,  # coming soon
         # fetch_google_jobs,     # coming soon
         # fetch_meta_jobs,       # coming soon

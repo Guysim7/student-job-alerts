@@ -4,8 +4,8 @@ student-job-alerts scraper
 Fetches student/intern job postings from top tech companies and
 reports any newly seen ones since the last run.
 
-Currently supported companies: Amazon
-(More will be added: Microsoft, Google, Meta, Apple)
+Currently supported companies: Amazon, Microsoft, NVIDIA, Apple
+(Potential future additions: Google, Meta)
 
 How it works:
   1. Each company has its own fetch function that returns a list of Job objects.
@@ -68,10 +68,10 @@ SEEN_JOBS_FILE = "seen_jobs.json"
 # Base URL used when building full links to Amazon job listings.
 AMAZON_BASE_URL = "https://www.amazon.jobs"
 
-# NVIDIA Workday API — base URL and Israel country filter ID.
+# NVIDIA Workday API — base URL (location facet filter causes intermittent 400s so we
+# paginate all intern results and filter Israel client-side instead).
 NVIDIA_WORKDAY_URL = "https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCareerSite/jobs"
 NVIDIA_WORKDAY_BASE_URL = "https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite"
-NVIDIA_ISRAEL_ID = "2fcb99c455831013ea52bbe14cf9326c"
 
 # Microsoft careers API — discovered by intercepting XHR calls on the careers page.
 MICROSOFT_SEARCH_URL = "https://apply.careers.microsoft.com/api/pcsx/search"
@@ -358,13 +358,126 @@ def fetch_microsoft_jobs() -> list[Job]:
     return jobs
 
 
+def fetch_apple_jobs() -> list[Job]:
+    """
+    Fetch student / intern job postings from Apple's careers site.
+
+    Apple renders job data server-side and embeds it in the page HTML as
+    window.__staticRouterHydrationData (a JSON-encoded string inside a <script>
+    tag). No separate API call is needed — a single GET request returns all
+    the data we need.
+
+    The search URL uses:
+      - location=israel-ISR   narrow to Israel postings
+      - search=intern         keyword match across title + description
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    import re as _re
+
+    try:
+        response = requests.get(
+            APPLE_SEARCH_URL,
+            impersonate="chrome",
+            timeout=15,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[Apple] Request failed: {e}")
+        return []
+
+    # Extract the SSR hydration JSON from the page HTML.
+    # Apple embeds all page data as: window.__staticRouterHydrationData = JSON.parse("...");
+    m = _re.search(
+        r'window\.__staticRouterHydrationData\s*=\s*JSON\.parse\("(.+?)"\);\s*</script>',
+        response.text,
+        _re.DOTALL,
+    )
+    if not m:
+        print("[Apple] Could not find hydration data in page HTML.")
+        return []
+
+    # The JSON is double-encoded (a JSON string containing escaped JSON).
+    # Decode the outer string escaping first, then parse the inner JSON.
+    try:
+        raw = m.group(1)
+        decoded = raw.encode("utf-8").decode("unicode_escape").encode("latin-1").decode("utf-8")
+        data = json.loads(decoded)
+    except Exception as e:
+        print(f"[Apple] Failed to parse hydration JSON: {e}")
+        return []
+
+    raw_jobs = data.get("loaderData", {}).get("search", {}).get("searchResults", [])
+    jobs = []
+
+    for item in raw_jobs:
+        position_id = item.get("positionId", "")
+        slug        = item.get("transformedPostingTitle", "")
+
+        # Build location string from the locations list (usually one entry)
+        location_parts = [
+            loc.get("name") or loc.get("countryName", "")
+            for loc in item.get("locations", [])
+        ]
+        location = ", ".join(filter(None, location_parts))
+
+        # Strip HTML tags from the job summary (Apple occasionally uses <b> etc.)
+        raw_summary = item.get("jobSummary", "")
+        summary = _re.sub(r"<[^>]+>", " ", raw_summary)
+        summary = _re.sub(r"\s+", " ", summary).strip()
+
+        job = Job(
+            job_id   = f"apple_{position_id}",
+            title    = item.get("postingTitle", ""),
+            company  = "Apple",
+            location = location,
+            url      = f"{APPLE_BASE_URL}/{position_id}/{slug}",
+            posted   = item.get("postingDate", ""),   # "Apr 29, 2026" — parsed by %b %d, %Y
+            summary  = summary,
+        )
+
+        if job.is_student_role() and job.is_bsc_level():
+            jobs.append(job)
+
+    return jobs
+
+
+def _nvidia_session() -> tuple | None:
+    """
+    Open a fresh Workday session and return (session, post_headers).
+
+    Workday requires a real browser session before accepting API calls:
+    the GET sets CALYPSO_SESSION + CALYPSO_CSRF_TOKEN cookies; the CSRF
+    token must also be sent as a request header.  Returns None on failure.
+    """
+    session = requests.Session(impersonate="chrome124")
+    try:
+        session.get("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite", timeout=15)
+    except Exception as e:
+        print(f"[NVIDIA] Session init failed: {e}")
+        return None
+    time.sleep(3)
+    csrf = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
+    headers = {"Content-Type": "application/json"}
+    if csrf:
+        headers["X-Workday-Client-CSRF-Token"] = csrf
+    return session, headers
+
+
 def fetch_nvidia_jobs() -> list[Job]:
     """
     Fetch student / intern job postings from NVIDIA's Workday career portal.
 
-    NVIDIA uses Workday as their ATS. Workday requires a valid browser session
-    before accepting API calls — we first GET the careers page to obtain a
-    session cookie, then POST to the search API with the Israel facet filter.
+    Strategy:
+      - The location facet (locationHierarchy1) causes intermittent 400s, so we
+        skip it and instead paginate through all 'intern' results (typically ~900),
+        filtering for Israel on our side.
+      - On a 400 we retry once with a brand-new session before giving up.
 
     The 'postedOn' field uses Workday's relative format ('Posted 3 Days Ago')
     which is handled by Job.age_in_days().
@@ -372,57 +485,73 @@ def fetch_nvidia_jobs() -> list[Job]:
     Returns:
         A list of Job objects for student roles located in Israel.
     """
-    session = requests.Session(impersonate="chrome")
-
-    try:
-        # Step 1: visit careers page to acquire a valid Workday session cookie
-        session.get("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite", timeout=10)
-        time.sleep(3)
-
-        # Step 2: POST to the search API — session cookie is sent automatically.
-        # Workday sometimes routes to a Calypso backend that requires the CSRF token
-        # as a request header (in addition to the cookie).
-        post_headers = {"Content-Type": "application/json"}
-        csrf_token = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
-        if csrf_token:
-            post_headers["X-Workday-Client-CSRF-Token"] = csrf_token
-
-        payload = {
-            "limit": 50,
-            "offset": 0,
-            "searchText": "intern",
-            "appliedFacets": {"locationHierarchy1": [NVIDIA_ISRAEL_ID]},
-        }
-        response = session.post(
-            NVIDIA_WORKDAY_URL,
-            json=payload,
-            headers=post_headers,
-            timeout=10,
-        )
-        response.raise_for_status()
-    except Exception as e:
-        print(f"[NVIDIA] Request failed: {e}")
+    sess_data = _nvidia_session()
+    if sess_data is None:
         return []
+    session, post_headers = sess_data
 
-    data     = response.json()
-    raw_jobs = data.get("jobPostings", [])
-    jobs     = []
+    raw_jobs: list[dict] = []
+    offset = 0
+    limit  = 100
 
+    while True:
+        payload = {
+            "limit": limit,
+            "offset": offset,
+            "searchText": "intern",
+            "appliedFacets": {},
+        }
+        try:
+            response = session.post(NVIDIA_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
+        except Exception as e:
+            print(f"[NVIDIA] Request failed: {e}")
+            break
+
+        if response.status_code == 400 and offset == 0:
+            # Cloudflare rejected our session — back off, then retry with a fresh one
+            print("[NVIDIA] Got 400, retrying with new session…")
+            time.sleep(5)
+            sess_data = _nvidia_session()
+            if sess_data is None:
+                break
+            session, post_headers = sess_data
+            try:
+                response = session.post(NVIDIA_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
+            except Exception as e:
+                print(f"[NVIDIA] Retry failed: {e}")
+                break
+
+        if response.status_code != 200:
+            print(f"[NVIDIA] Request failed: HTTP {response.status_code}")
+            break
+
+        data  = response.json()
+        total = data.get("total", 0)
+        page  = data.get("jobPostings", [])
+        if not page:
+            break
+        raw_jobs.extend(page)
+        offset += len(page)
+        if offset >= total:
+            break
+        time.sleep(0.5)
+
+    jobs = []
     for item in raw_jobs:
-        # Build job ID from the external path (e.g. /job/Israel-Tel-Aviv/..._JR123456)
-        job_id = item.get("bulletFields", [""])[0] or item.get("externalPath", "")
+        loc = item.get("locationsText", "")
+        if not any(kw in loc.lower() for kw in ISRAEL_KEYWORDS):
+            continue
 
+        job_id = item.get("bulletFields", [""])[0] or item.get("externalPath", "")
         job = Job(
             job_id   = f"nvidia_{job_id}",
             title    = item.get("title", ""),
             company  = "NVIDIA",
-            location = item.get("locationsText", ""),
+            location = loc,
             url      = NVIDIA_WORKDAY_BASE_URL + item.get("externalPath", ""),
             posted   = item.get("postedOn", ""),
         )
-        # Workday returns all Israel jobs matching "intern" in description;
-        # filter titles to ensure it's actually a student-facing role.
-        if job.is_student_role():
+        if job.is_student_role() and job.is_bsc_level():
             jobs.append(job)
 
     return jobs
@@ -579,10 +708,10 @@ def run_all_scrapers() -> list[Job]:
     scrapers = [
         fetch_amazon_jobs,
         fetch_microsoft_jobs,
-        # fetch_nvidia_jobs,   # TODO: Cloudflare bot protection blocks reliable scraping
+        fetch_nvidia_jobs,
         # fetch_google_jobs,   # TODO: blocks headless browsers, protobuf API
         # fetch_meta_jobs,     # TODO: very few Israel intern jobs, requires Playwright session
-        # fetch_apple_jobs,    # TODO: no accessible API found yet
+        fetch_apple_jobs,
     ]
 
     for scraper in scrapers:

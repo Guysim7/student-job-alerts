@@ -4,8 +4,8 @@ student-job-alerts scraper
 Fetches student/intern job postings from top tech companies and
 reports any newly seen ones since the last run.
 
-Currently supported companies: Amazon, Microsoft, NVIDIA, Apple
-(Potential future additions: Google, Meta)
+Currently supported companies: Amazon, Microsoft, NVIDIA, Apple, Intel, Check Point
+(Potential future additions: Google, Meta — both require Playwright)
 
 How it works:
   1. Each company has its own fetch function that returns a list of Job objects.
@@ -81,6 +81,14 @@ MICROSOFT_BASE_URL = "https://jobs.careers.microsoft.com"
 # Location code for Israel is "israel-ISR"; keyword search filters all job text.
 APPLE_SEARCH_URL = "https://jobs.apple.com/en-us/search?location=israel-ISR&search=intern"
 APPLE_BASE_URL   = "https://jobs.apple.com/en-us/details"
+
+# Intel careers — Workday API (no session/CSRF required, unlike NVIDIA).
+INTEL_WORKDAY_URL      = "https://intel.wd1.myworkdayjobs.com/wday/cxs/intel/External/jobs"
+INTEL_WORKDAY_BASE_URL = "https://intel.wd1.myworkdayjobs.com/en-US/External"
+
+# Check Point careers — SmartRecruiters public REST API.
+CHECKPOINT_API_URL  = "https://api.smartrecruiters.com/v1/companies/checkpointsoftwaretechnologies/postings"
+CHECKPOINT_BASE_URL = "https://jobs.smartrecruiters.com/CheckPointSoftwareTechnologies"
 
 
 # ── Data model ───────────────────────────────────────────────────────────────
@@ -447,6 +455,159 @@ def fetch_apple_jobs() -> list[Job]:
     return jobs
 
 
+def _intel_session() -> tuple:
+    """Open a Workday session for Intel and return (session, post_headers)."""
+    session = requests.Session(impersonate="chrome")
+    try:
+        session.get("https://intel.wd1.myworkdayjobs.com/External", timeout=15)
+    except Exception as e:
+        print(f"[Intel] Session init failed: {e}")
+    time.sleep(3)
+    csrf = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
+    headers = {"Content-Type": "application/json"}
+    if csrf:
+        headers["X-Workday-Client-CSRF-Token"] = csrf
+    return session, headers
+
+
+def fetch_intel_jobs() -> list[Job]:
+    """
+    Fetch student / intern job postings from Intel's Workday career portal.
+
+    Intel uses the same Workday platform as NVIDIA. A session is used to avoid
+    intermittent 400s from Cloudflare. Israel filtering is done client-side.
+    Intel has ~400–500 intern results total; we paginate at 100 per page.
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    session, post_headers = _intel_session()
+    raw_jobs: list[dict] = []
+    offset, limit = 0, 100
+
+    while True:
+        payload = {"limit": limit, "offset": offset, "searchText": "intern", "appliedFacets": {}}
+        try:
+            response = session.post(INTEL_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
+        except Exception as e:
+            print(f"[Intel] Request failed: {e}")
+            break
+
+        if response.status_code == 400 and offset == 0:
+            print("[Intel] Got 400, retrying with new session…")
+            time.sleep(5)
+            session, post_headers = _intel_session()
+            try:
+                response = session.post(INTEL_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
+            except Exception as e:
+                print(f"[Intel] Retry failed: {e}")
+                break
+
+        if response.status_code != 200:
+            print(f"[Intel] Request failed: HTTP {response.status_code}")
+            break
+
+        data  = response.json()
+        total = data.get("total", 0)
+        page  = data.get("jobPostings", [])
+        if not page:
+            break
+        raw_jobs.extend(page)
+        offset += len(page)
+        if offset >= total:
+            break
+        time.sleep(0.5)
+
+    jobs = []
+    for item in raw_jobs:
+        loc = item.get("locationsText", "")
+        if not any(kw in loc.lower() for kw in ISRAEL_KEYWORDS):
+            continue
+
+        job_id = item.get("bulletFields", [""])[0] or item.get("externalPath", "")
+        job = Job(
+            job_id   = f"intel_{job_id}",
+            title    = item.get("title", ""),
+            company  = "Intel",
+            location = loc,
+            url      = INTEL_WORKDAY_BASE_URL + item.get("externalPath", ""),
+            posted   = item.get("postedOn", ""),
+        )
+        if job.is_student_role() and job.is_bsc_level():
+            jobs.append(job)
+
+    return jobs
+
+
+def fetch_checkpoint_jobs() -> list[Job]:
+    """
+    Fetch student / intern job postings from Check Point's SmartRecruiters board.
+
+    Check Point uses SmartRecruiters as their ATS. The public API requires no
+    authentication and returns JSON with full location and date information.
+
+    Israel is identified by location.country == "IL". The releasedDate field
+    is ISO 8601 (e.g. "2025-01-15T10:00:00.000Z"); we slice to "YYYY-MM-DD"
+    which age_in_days() already handles.
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    raw_jobs: list[dict] = []
+    offset, limit = 0, 100
+
+    while True:
+        try:
+            response = requests.get(
+                CHECKPOINT_API_URL,
+                params={"limit": limit, "offset": offset},
+                impersonate="chrome",
+                timeout=15,
+            )
+            response.raise_for_status()
+        except Exception as e:
+            print(f"[Check Point] Request failed: {e}")
+            break
+
+        data  = response.json()
+        total = data.get("totalFound", 0)
+        page  = data.get("content", [])
+        if not page:
+            break
+        raw_jobs.extend(page)
+        offset += len(page)
+        if offset >= total:
+            break
+        time.sleep(0.5)
+
+    jobs = []
+    for item in raw_jobs:
+        loc_obj  = item.get("location", {})
+        country  = loc_obj.get("country", "")
+        city     = loc_obj.get("city", "")
+        location = ", ".join(filter(None, [city, country]))
+
+        if country.lower() != "il" and not any(kw in location.lower() for kw in ISRAEL_KEYWORDS):
+            continue
+
+        released = item.get("releasedDate", "")
+        posted   = released[:10] if released else ""   # "2025-01-15T..." → "2025-01-15"
+        job_id   = item.get("id", "")
+
+        job = Job(
+            job_id   = f"checkpoint_{job_id}",
+            title    = item.get("name", ""),
+            company  = "Check Point",
+            location = location,
+            url      = f"{CHECKPOINT_BASE_URL}/{job_id}",
+            posted   = posted,
+        )
+        if job.is_student_role() and job.is_bsc_level():
+            jobs.append(job)
+
+    return jobs
+
+
 def _nvidia_session() -> tuple | None:
     """
     Open a fresh Workday session and return (session, post_headers).
@@ -712,6 +873,10 @@ def run_all_scrapers() -> list[Job]:
         # fetch_google_jobs,   # TODO: blocks headless browsers, protobuf API
         # fetch_meta_jobs,     # TODO: very few Israel intern jobs, requires Playwright session
         fetch_apple_jobs,
+        fetch_intel_jobs,
+        fetch_checkpoint_jobs,
+        # fetch_google_jobs,  # requires Playwright (client-side rendered)
+        # fetch_meta_jobs,    # requires Playwright (client-side rendered)
     ]
 
     for scraper in scrapers:

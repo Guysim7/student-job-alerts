@@ -2,8 +2,8 @@ name: Student Job Alerts
 
 on:
   schedule:
-    # Every 30 min, Mon–Fri, 13:00–23:00 UTC (9am–7pm ET — US business hours)
-    - cron: "0,30 13-23 * * 1-5"
+    # Every hour, 24/7
+    - cron: "0 * * * *"
   workflow_dispatch:
     # Allows you to trigger a manual run from the GitHub Actions tab
 

@@ -4,8 +4,8 @@ student-job-alerts scraper
 Fetches student/intern job postings from top tech companies and
 reports any newly seen ones since the last run.
 
-Currently supported companies: Amazon, Microsoft, NVIDIA, Apple, Intel, Check Point
-(Potential future additions: Google, Meta — both require Playwright)
+Currently supported companies: Amazon, Microsoft, NVIDIA, Apple, Intel, Check Point, Mobileye
+(Requires Playwright: Google, Meta, Cisco, IBM, Qualcomm)
 
 How it works:
   1. Each company has its own fetch function that returns a list of Job objects.
@@ -89,6 +89,9 @@ INTEL_WORKDAY_BASE_URL = "https://intel.wd1.myworkdayjobs.com/en-US/External"
 # Check Point careers — SmartRecruiters public REST API.
 CHECKPOINT_API_URL  = "https://api.smartrecruiters.com/v1/companies/checkpointsoftwaretechnologies/postings"
 CHECKPOINT_BASE_URL = "https://jobs.smartrecruiters.com/CheckPointSoftwareTechnologies"
+
+# Mobileye careers — public JSON API (no auth, returns all jobs in one request).
+MOBILEYE_API_URL = "https://careers-api.mbly.co/jobs"
 
 
 # ── Data model ───────────────────────────────────────────────────────────────
@@ -608,6 +611,56 @@ def fetch_checkpoint_jobs() -> list[Job]:
     return jobs
 
 
+def fetch_mobileye_jobs() -> list[Job]:
+    """
+    Fetch job postings from Mobileye's public careers API.
+
+    Mobileye exposes a flat JSON array at careers-api.mbly.co/jobs with no
+    authentication. One request returns all ~130 listings; ~120 are in Israel.
+    The applyUrl points to their Lever-hosted application page.
+
+    createdAt is a Unix timestamp in milliseconds; we convert to YYYY-MM-DD
+    for compatibility with age_in_days().
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    try:
+        response = requests.get(MOBILEYE_API_URL, impersonate="chrome", timeout=15)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[Mobileye] Request failed: {e}")
+        return []
+
+    jobs = []
+    for item in response.json():
+        categories = item.get("categories", {})
+        location   = categories.get("location", "")
+
+        if not any(kw in location.lower() for kw in ISRAEL_KEYWORDS):
+            continue
+
+        created_ms = item.get("createdAt", 0)
+        posted     = datetime.fromtimestamp(created_ms / 1000).strftime("%Y-%m-%d") if created_ms else ""
+
+        raw_desc = item.get("descriptionBodyPlain", "")
+        summary  = raw_desc[:400] + "…" if len(raw_desc) > 400 else raw_desc
+
+        job = Job(
+            job_id   = f"mobileye_{item.get('id', '')}",
+            title    = item.get("text", ""),
+            company  = "Mobileye",
+            location = location,
+            url      = item.get("applyUrl", ""),
+            posted   = posted,
+            summary  = summary,
+        )
+        if job.is_student_role() and job.is_bsc_level():
+            jobs.append(job)
+
+    return jobs
+
+
 def _nvidia_session() -> tuple | None:
     """
     Open a fresh Workday session and return (session, post_headers).
@@ -875,8 +928,12 @@ def run_all_scrapers() -> list[Job]:
         fetch_apple_jobs,
         fetch_intel_jobs,
         fetch_checkpoint_jobs,
-        # fetch_google_jobs,  # requires Playwright (client-side rendered)
-        # fetch_meta_jobs,    # requires Playwright (client-side rendered)
+        fetch_mobileye_jobs,
+        # fetch_google_jobs,    # requires Playwright (client-side rendered)
+        # fetch_meta_jobs,      # requires Playwright (client-side rendered)
+        # fetch_cisco_jobs,     # Phenom People, requires Playwright
+        # fetch_ibm_jobs,       # AWS WAF + client-side rendering, requires Playwright
+        # fetch_qualcomm_jobs,  # custom SPA, API returns 401
     ]
 
     for scraper in scrapers:

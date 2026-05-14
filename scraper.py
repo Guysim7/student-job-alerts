@@ -236,7 +236,11 @@ def fetch_amazon_jobs() -> list[Job]:
         print(f"[Amazon] Request failed: {e}")
         return []
 
-    data     = response.json()
+    try:
+        data = response.json()
+    except Exception as e:
+        print(f"[Amazon] Failed to parse response: {e}")
+        return []
     raw_jobs = data.get("jobs", [])
     jobs     = []
 
@@ -342,7 +346,11 @@ def fetch_microsoft_jobs() -> list[Job]:
         print(f"[Microsoft] Request failed: {e}")
         return []
 
-    positions = response.json().get("data", {}).get("positions", [])
+    try:
+        positions = response.json().get("data", {}).get("positions", [])
+    except Exception as e:
+        print(f"[Microsoft] Failed to parse response: {e}")
+        return []
     jobs = []
 
     for item in positions:
@@ -460,12 +468,12 @@ def fetch_apple_jobs() -> list[Job]:
 
 def _intel_session() -> tuple:
     """Open a Workday session for Intel and return (session, post_headers)."""
-    session = requests.Session(impersonate="chrome")
+    session = requests.Session(impersonate="chrome136")
     try:
         session.get("https://intel.wd1.myworkdayjobs.com/External", timeout=15)
     except Exception as e:
         print(f"[Intel] Session init failed: {e}")
-    time.sleep(3)
+    time.sleep(8)
     csrf = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
     headers = {"Content-Type": "application/json"}
     if csrf:
@@ -632,8 +640,13 @@ def fetch_mobileye_jobs() -> list[Job]:
         print(f"[Mobileye] Request failed: {e}")
         return []
 
+    try:
+        raw = response.json()
+    except Exception as e:
+        print(f"[Mobileye] Failed to parse response: {e}")
+        return []
     jobs = []
-    for item in response.json():
+    for item in raw:
         categories = item.get("categories", {})
         location   = categories.get("location", "")
 
@@ -669,13 +682,13 @@ def _nvidia_session() -> tuple | None:
     the GET sets CALYPSO_SESSION + CALYPSO_CSRF_TOKEN cookies; the CSRF
     token must also be sent as a request header.  Returns None on failure.
     """
-    session = requests.Session(impersonate="chrome124")
+    session = requests.Session(impersonate="chrome136")
     try:
         session.get("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite", timeout=15)
     except Exception as e:
         print(f"[NVIDIA] Session init failed: {e}")
         return None
-    time.sleep(3)
+    time.sleep(8)
     csrf = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
     headers = {"Content-Type": "application/json"}
     if csrf:
@@ -937,9 +950,12 @@ def run_all_scrapers() -> list[Job]:
     ]
 
     for scraper in scrapers:
-        company_jobs = scraper()
-        print(f"[{scraper.__name__}] Found {len(company_jobs)} student roles.")
-        all_jobs.extend(company_jobs)
+        try:
+            company_jobs = scraper()
+            print(f"[{scraper.__name__}] Found {len(company_jobs)} student roles.")
+            all_jobs.extend(company_jobs)
+        except Exception as e:
+            print(f"[{scraper.__name__}] CRASHED: {e}")
 
     return all_jobs
 

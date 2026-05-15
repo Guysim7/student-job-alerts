@@ -8,7 +8,7 @@ on:
 
 jobs:
   # Runs on GitHub's servers — no PC needed.
-  # Handles: Amazon, Microsoft, Apple, Check Point, Mobileye
+  # Handles: Amazon, Microsoft, Apple, Check Point, Mobileye, Motorola, monday.com, CyberArk
   scrape-main:
     runs-on: ubuntu-latest
     steps:

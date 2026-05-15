@@ -4,7 +4,7 @@ student-job-alerts scraper
 Fetches student/intern job postings from top tech companies and
 reports any newly seen ones since the last run.
 
-Currently supported companies: Amazon, Microsoft, NVIDIA, Apple, Intel, Check Point, Mobileye
+Currently supported companies: Amazon, Microsoft, NVIDIA, Apple, Intel, Check Point, Mobileye, Motorola Solutions, monday.com, CyberArk
 (Requires Playwright: Google, Meta, Cisco, IBM, Qualcomm)
 
 How it works:
@@ -94,6 +94,20 @@ CHECKPOINT_BASE_URL = "https://jobs.smartrecruiters.com/CheckPointSoftwareTechno
 
 # Mobileye careers — public JSON API (no auth, returns all jobs in one request).
 MOBILEYE_API_URL = "https://careers-api.mbly.co/jobs"
+
+# Motorola Solutions careers — Workday API (direct POST, no Playwright needed).
+# Israel country facet ID taken from the API's facets response (stable Workday UUID).
+MOTOROLA_WORKDAY_URL      = "https://motorolasolutions.wd5.myworkdayjobs.com/wday/cxs/motorolasolutions/Careers/jobs"
+MOTOROLA_WORKDAY_BASE_URL = "https://motorolasolutions.wd5.myworkdayjobs.com/en-US/Careers"
+MOTOROLA_ISRAEL_FACET_ID  = "084562884af243748dad7c84c304d89a"
+
+# monday.com careers — Comeet API (public, token embedded in their careers page).
+MONDAY_COMEET_URL   = "https://www.comeet.co/careers-api/2.0/company/41.00B/positions"
+MONDAY_COMEET_TOKEN = "14B52C52C67790D3E1296BA37C20"
+
+# CyberArk careers — SmartRecruiters public REST API (same pattern as Check Point).
+CYBERARK_API_URL  = "https://api.smartrecruiters.com/v1/companies/Cyberark1/postings"
+CYBERARK_BASE_URL = "https://jobs.smartrecruiters.com/CyberArk"
 
 
 # ── Data model ───────────────────────────────────────────────────────────────
@@ -759,6 +773,183 @@ def fetch_mobileye_jobs() -> list[Job]:
     return jobs
 
 
+def fetch_motorola_jobs() -> list[Job]:
+    """
+    Fetch Motorola Solutions intern jobs from Workday via direct POST API.
+
+    Motorola's Workday instance does not require Playwright — the API responds
+    to direct curl_cffi requests. We pre-filter to Israel using the country
+    facet ID discovered from the API's facets response (stable Workday UUID).
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    try:
+        response = requests.post(
+            MOTOROLA_WORKDAY_URL,
+            json={
+                "searchText": "intern",
+                "limit": 50,
+                "offset": 0,
+                "appliedFacets": {"locationCountry": [MOTOROLA_ISRAEL_FACET_ID]},
+            },
+            impersonate="chrome",
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[Motorola] Request failed: {e}")
+        return []
+
+    try:
+        data = response.json()
+    except Exception as e:
+        print(f"[Motorola] Failed to parse response: {e}")
+        return []
+
+    jobs = []
+    for item in data.get("jobPostings", []):
+        loc = item.get("locationsText", "")
+        fields = item.get("bulletFields", [])
+        job_id = fields[1] if len(fields) > 1 else item.get("externalPath", "")
+        job = Job(
+            job_id   = f"motorola_{job_id}",
+            title    = item.get("title", ""),
+            company  = "Motorola Solutions",
+            location = loc,
+            url      = MOTOROLA_WORKDAY_BASE_URL + item.get("externalPath", ""),
+            posted   = item.get("postedOn", ""),
+        )
+        if job.is_student_role() and job.is_bsc_level():
+            jobs.append(job)
+
+    return jobs
+
+
+def fetch_monday_jobs() -> list[Job]:
+    """
+    Fetch monday.com intern jobs from their Comeet careers API.
+
+    monday.com uses Comeet as their ATS. The API endpoint and token are
+    embedded in their public careers page and are stable (job board tokens,
+    not user session tokens).
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    try:
+        response = requests.get(
+            MONDAY_COMEET_URL,
+            params={"token": MONDAY_COMEET_TOKEN},
+            impersonate="chrome",
+            timeout=15,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[monday.com] Request failed: {e}")
+        return []
+
+    try:
+        raw = response.json()
+    except Exception as e:
+        print(f"[monday.com] Failed to parse response: {e}")
+        return []
+
+    jobs = []
+    for item in raw:
+        loc_obj = item.get("location", {})
+        country  = (loc_obj.get("country", "") if isinstance(loc_obj, dict) else "").lower()
+        city     = loc_obj.get("city", "")      if isinstance(loc_obj, dict) else ""
+        loc_name = loc_obj.get("name", "")      if isinstance(loc_obj, dict) else str(loc_obj)
+        location = city or loc_name
+
+        if country != "il" and not any(kw in location.lower() for kw in ISRAEL_KEYWORDS):
+            continue
+
+        uid     = item.get("uid", "")
+        url     = item.get("url_active_page", "") or item.get("url_comeet_hosted_page", "")
+        updated = item.get("time_updated", 0)
+        posted  = datetime.fromtimestamp(updated).strftime("%Y-%m-%d") if updated else ""
+
+        job = Job(
+            job_id   = f"monday_{uid}",
+            title    = item.get("name", ""),
+            company  = "monday.com",
+            location = location,
+            url      = url,
+            posted   = posted,
+        )
+        if job.is_student_role() and job.is_bsc_level():
+            jobs.append(job)
+
+    return jobs
+
+
+def fetch_cyberark_jobs() -> list[Job]:
+    """
+    Fetch CyberArk intern jobs from SmartRecruiters (same pattern as Check Point).
+
+    CyberArk's SmartRecruiters company slug is 'Cyberark1'. Pagination uses
+    the same offset/totalFound approach as the Check Point scraper.
+
+    Returns:
+        A list of Job objects for student roles located in Israel.
+    """
+    raw_jobs: list[dict] = []
+    offset, limit = 0, 100
+
+    while True:
+        try:
+            response = requests.get(
+                CYBERARK_API_URL,
+                params={"limit": limit, "offset": offset},
+                impersonate="chrome",
+                timeout=15,
+            )
+            response.raise_for_status()
+        except Exception as e:
+            print(f"[CyberArk] Request failed: {e}")
+            break
+
+        data  = response.json()
+        total = data.get("totalFound", 0)
+        page  = data.get("content", [])
+        if not page:
+            break
+        raw_jobs.extend(page)
+        offset += len(page)
+        if offset >= total:
+            break
+        time.sleep(0.5)
+
+    jobs = []
+    for item in raw_jobs:
+        loc_obj  = item.get("location", {})
+        country  = loc_obj.get("country", "")
+        city     = loc_obj.get("city", "")
+        location = ", ".join(filter(None, [city, country]))
+
+        if country.lower() != "il" and not any(kw in location.lower() for kw in ISRAEL_KEYWORDS):
+            continue
+
+        released = item.get("releasedDate", "")
+        posted   = released[:10] if released else ""
+        job_id   = item.get("id", "")
+
+        job = Job(
+            job_id   = f"cyberark_{job_id}",
+            title    = item.get("name", ""),
+            company  = "CyberArk",
+            location = location,
+            url      = f"{CYBERARK_BASE_URL}/{job_id}",
+            posted   = posted,
+        )
+        if job.is_student_role() and job.is_bsc_level():
+            jobs.append(job)
+
+    return jobs
+
+
 def fetch_nvidia_jobs() -> list[Job]:
     """Fetch NVIDIA intern jobs from Workday using Playwright to bypass Cloudflare."""
     return _workday_playwright_fetch(
@@ -927,6 +1118,9 @@ def run_all_scrapers() -> list[Job]:
         fetch_apple_jobs,
         fetch_checkpoint_jobs,
         fetch_mobileye_jobs,
+        fetch_motorola_jobs,
+        fetch_monday_jobs,
+        fetch_cyberark_jobs,
     ]
 
     workday_scrapers = [

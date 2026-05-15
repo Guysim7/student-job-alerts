@@ -528,7 +528,7 @@ def _workday_playwright_fetch(
             try:
                 resp = page.request.post(api_url, data=payload, headers=headers)
                 if resp.status != 200:
-                    print(f"[{label}] API returned {resp.status}")
+                    print(f"[{label}] API returned {resp.status}: {resp.text()[:120]}")
                     break
                 data = resp.json()
             except Exception as e:

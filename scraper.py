@@ -488,17 +488,29 @@ def _workday_playwright_fetch(
     raw_jobs: list[dict] = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
+        # Hide the navigator.webdriver flag that Cloudflare checks for headless bots
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
         try:
             page.goto(page_url, wait_until="networkidle", timeout=30000)
         except Exception as e:
             print(f"[{label}] Page load failed: {e}")
+            context.close()
             browser.close()
             return []
 
-        cookies = page.context.cookies()
+        cookies = context.cookies()
         csrf = next((c["value"] for c in cookies if c["name"] == "CALYPSO_CSRF_TOKEN"), "")
         headers = {"Content-Type": "application/json"}
         if csrf:
@@ -526,6 +538,7 @@ def _workday_playwright_fetch(
             if offset >= total:
                 break
 
+        context.close()
         browser.close()
 
     jobs = []

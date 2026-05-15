@@ -512,8 +512,13 @@ def _workday_playwright_fetch(
 
         cookies = context.cookies()
         csrf = next((c["value"] for c in cookies if c["name"] == "CALYPSO_CSRF_TOKEN"), "")
-        print(f"[{label}] Page loaded: {page.url[:60]} | CSRF: {bool(csrf)}")
-        headers = {"Content-Type": "application/json"}
+        # page.request has an isolated cookie jar — manually forward all browser
+        # cookies (CALYPSO_SESSION, __cf_bm, etc.) so Workday accepts the request.
+        cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+        headers = {
+            "Content-Type": "application/json",
+            "Cookie": cookie_header,
+        }
         if csrf:
             headers["X-Workday-Client-CSRF-Token"] = csrf
 

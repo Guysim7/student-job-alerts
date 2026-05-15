@@ -45,6 +45,27 @@ jobs:
           path: seen_jobs.json
           key: seen-jobs-main-${{ github.run_id }}
 
+      - name: Notify success
+        if: success()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="✅ Main scraper ran successfully" \
+            -d disable_notification=true
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="⚠️ Main scraper failed — check GitHub Actions"
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
   # Runs on your PC — only when it's on.
   # Handles: NVIDIA, Intel, Google, Meta (need Playwright)
   scrape-workday:
@@ -71,3 +92,24 @@ jobs:
           SCRAPER_GROUP: workday
         # seen_jobs_workday.json lives at $HOME on the runner — persists across runs
         run: SEEN_JOBS_FILE="$HOME/seen_jobs_workday.json" python scraper.py
+
+      - name: Notify success
+        if: success()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="✅ Workday scraper ran successfully" \
+            -d disable_notification=true
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="⚠️ Workday scraper failed — check GitHub Actions"
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

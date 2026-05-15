@@ -840,28 +840,36 @@ def notify_new_jobs(new_jobs: list[Job]) -> None:
 
 def run_all_scrapers() -> list[Job]:
     """
-    Run every company scraper and return the combined list of jobs.
+    Run scrapers and return the combined list of jobs.
 
-    To add a new company later, define a fetch_<company>_jobs() function
-    and add it to the list below.
+    SCRAPER_GROUP env var controls which subset runs:
+      main    → curl_cffi scrapers (run on ubuntu-latest, no PC needed)
+      workday → Playwright scrapers (run on self-hosted runner, needs PC)
+      unset   → all scrapers
     """
-    all_jobs = []
-    scrapers = [
+    group = os.getenv("SCRAPER_GROUP", "all")
+
+    main_scrapers = [
         fetch_amazon_jobs,
         fetch_microsoft_jobs,
-        fetch_nvidia_jobs,
-        # fetch_google_jobs,   # TODO: blocks headless browsers, protobuf API
-        # fetch_meta_jobs,     # TODO: very few Israel intern jobs, requires Playwright session
         fetch_apple_jobs,
-        fetch_intel_jobs,
         fetch_checkpoint_jobs,
         fetch_mobileye_jobs,
-        # fetch_google_jobs,    # requires Playwright (client-side rendered)
-        # fetch_meta_jobs,      # requires Playwright (client-side rendered)
-        # fetch_cisco_jobs,     # Phenom People, requires Playwright
-        # fetch_ibm_jobs,       # AWS WAF + client-side rendering, requires Playwright
-        # fetch_qualcomm_jobs,  # custom SPA, API returns 401
     ]
+
+    workday_scrapers = [
+        fetch_nvidia_jobs,
+        fetch_intel_jobs,
+    ]
+
+    if group == "main":
+        scrapers = main_scrapers
+    elif group == "workday":
+        scrapers = workday_scrapers
+    else:
+        scrapers = main_scrapers + workday_scrapers
+
+    all_jobs = []
 
     for scraper in scrapers:
         try:

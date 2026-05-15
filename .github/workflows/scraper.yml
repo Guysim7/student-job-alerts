@@ -5,12 +5,50 @@ on:
     # Every hour, 24/7
     - cron: "0 * * * *"
   workflow_dispatch:
-    # Allows you to trigger a manual run from the GitHub Actions tab
 
 jobs:
-  scrape:
-    runs-on: self-hosted
+  # Runs on GitHub's servers — no PC needed.
+  # Handles: Amazon, Microsoft, Apple, Check Point, Mobileye
+  scrape-main:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore seen jobs cache
+        uses: actions/cache@v4
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-main-${{ github.run_id }}
+          restore-keys: |
+            seen-jobs-main-
+
+      - name: Run scraper
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCRAPER_GROUP: main
+        run: python scraper.py
+
+      - name: Save seen jobs cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: seen_jobs.json
+          key: seen-jobs-main-${{ github.run_id }}
+
+  # Runs on your PC — only when it's on.
+  # Handles: NVIDIA, Intel (need Playwright to bypass Cloudflare)
+  scrape-workday:
+    runs-on: self-hosted
     steps:
       - name: Check out the repo
         uses: actions/checkout@v4
@@ -30,5 +68,6 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        # SEEN_JOBS_FILE points outside the workspace so it persists across runs
-        run: SEEN_JOBS_FILE="$HOME/seen_jobs.json" python scraper.py
+          SCRAPER_GROUP: workday
+        # seen_jobs_workday.json lives at $HOME on the runner — persists across runs
+        run: SEEN_JOBS_FILE="$HOME/seen_jobs_workday.json" python scraper.py

@@ -60,7 +60,7 @@ CS_KEYWORDS = [
 ]
 
 # Only jobs located in Israel will be reported.
-ISRAEL_KEYWORDS = ["israel", "tel aviv", "tel-aviv", "haifa", "jerusalem", "herzliya", "beer sheva", "il,"]
+ISRAEL_KEYWORDS = ["israel", "tel aviv", "tel-aviv", "haifa", "jerusalem", "herzliya", "beer sheva", "petah tikva", "petah tiqwa", "rehovot", "ramat gan", "rishon", "yakum", "il,"]
 
 # File that persists job IDs we've already seen across runs.
 # On a self-hosted runner, SEEN_JOBS_FILE points to a path outside the
@@ -607,7 +607,8 @@ def _workday_playwright_fetch(
         browser.close()
 
     # Prefer the Israel-filtered phase 2 results; fall back to phase 1
-    raw_responses = phase2 if (israel_facet_id and phase2) else phase1
+    using_israel_filter = bool(israel_facet_id and phase2)
+    raw_responses = phase2 if using_israel_filter else phase1
 
     raw_jobs: list[dict] = []
     for resp_data in raw_responses:
@@ -618,12 +619,16 @@ def _workday_playwright_fetch(
         return []
 
     total_api = max((d.get("total", 0) for d in raw_responses), default=0)
-    print(f"[{label}] Captured {len(raw_jobs)} jobs from API (total reported: {total_api})")
+    print(f"[{label}] Captured {len(raw_jobs)} jobs from API (total reported: {total_api}, israel_filter={using_israel_filter})")
 
     jobs = []
     for item in raw_jobs:
         loc = item.get("locationsText", "")
-        if not any(kw in loc.lower() for kw in ISRAEL_KEYWORDS):
+
+        # If Workday already filtered to Israel via facet, skip the location string
+        # check — it would drop jobs in cities not in ISRAEL_KEYWORDS (e.g. Petah Tikva).
+        # For phase 1 (global results), still check to avoid non-Israel roles.
+        if not using_israel_filter and not any(kw in loc.lower() for kw in ISRAEL_KEYWORDS):
             continue
 
         job_id = item.get("bulletFields", [""])[0] or item.get("externalPath", "")
@@ -637,6 +642,8 @@ def _workday_playwright_fetch(
         )
         if job.is_student_role() and job.is_bsc_level():
             jobs.append(job)
+        else:
+            print(f"[{label}] Skipped (filter): {job.title!r} @ {loc!r}")
 
     return jobs
 

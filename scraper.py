@@ -21,7 +21,7 @@ Usage:
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, date, timedelta
 # curl_cffi impersonates Chrome's TLS fingerprint, which bypasses Cloudflare bot
 # detection on sites like NVIDIA. It is API-compatible with the requests library.
 from curl_cffi import requests
@@ -65,7 +65,10 @@ ISRAEL_KEYWORDS = ["israel", "tel aviv", "tel-aviv", "haifa", "jerusalem", "herz
 # File that persists job IDs we've already seen across runs.
 # On a self-hosted runner, SEEN_JOBS_FILE points to a path outside the
 # workspace so it survives git checkout on each run.
-SEEN_JOBS_FILE = os.getenv("SEEN_JOBS_FILE", "seen_jobs.json")
+SEEN_JOBS_FILE        = os.getenv("SEEN_JOBS_FILE", "seen_jobs.json")
+SEEN_JOBS_EXPIRY_DAYS = 90   # drop entries older than this from seen_jobs.json
+TELEGRAM_OFFSET_FILE  = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
+HEARTBEAT_FILE        = os.getenv("HEARTBEAT_FILE", "heartbeat_workday.json")
 
 # Base URL used when building full links to Amazon job listings.
 AMAZON_BASE_URL = "https://www.amazon.jobs"
@@ -1243,28 +1246,33 @@ def fetch_meta_jobs() -> list[Job]:
 
 # ── Persistence (seen-jobs tracking) ─────────────────────────────────────────
 
-def load_seen_jobs() -> set[str]:
+def load_seen_jobs() -> dict[str, str]:
     """
-    Load the set of job IDs we have already reported.
+    Load seen job IDs from disk.
 
-    Returns an empty set if the file does not exist yet (first run).
+    Returns a dict mapping job_id → ISO date first seen.
+    Entries older than SEEN_JOBS_EXPIRY_DAYS are dropped automatically.
+    Migrates transparently from the old list format.
     """
     if not os.path.exists(SEEN_JOBS_FILE):
-        return set()
+        return {}
 
     with open(SEEN_JOBS_FILE, "r") as f:
-        return set(json.load(f))
+        data = json.load(f)
+
+    # Migrate from old list-of-strings format
+    if isinstance(data, list):
+        today = date.today().isoformat()
+        data = {job_id: today for job_id in data}
+
+    cutoff = (date.today() - timedelta(days=SEEN_JOBS_EXPIRY_DAYS)).isoformat()
+    return {job_id: seen_date for job_id, seen_date in data.items() if seen_date >= cutoff}
 
 
-def save_seen_jobs(seen: set[str]) -> None:
-    """
-    Persist the set of seen job IDs to disk so the next run knows what's new.
-
-    Args:
-        seen: The complete set of job IDs seen so far.
-    """
+def save_seen_jobs(seen: dict[str, str]) -> None:
+    """Persist the seen-job dict to disk."""
     with open(SEEN_JOBS_FILE, "w") as f:
-        json.dump(list(seen), f)
+        json.dump(seen, f, indent=2)
 
 
 # ── Notifications ────────────────────────────────────────────────────────────
@@ -1302,15 +1310,13 @@ def _format_bullets(summary: str, max_bullets: int = 4, max_len: int = 80) -> st
 
     return "\n".join(bullets)
 
-def send_telegram_message(text: str) -> None:
+def send_telegram_message(text: str, silent: bool = False) -> None:
     """
     Send a message to your Telegram chat via the bot.
 
-    Uses the Telegram Bot API's sendMessage endpoint.
-    Credentials are read from the .env file (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID).
-
     Args:
-        text: The message text to send. Supports HTML formatting.
+        text:   The message text to send. Supports HTML formatting.
+        silent: If True, deliver with no sound or banner (notification still appears in chat).
     """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
@@ -1318,6 +1324,7 @@ def send_telegram_message(text: str) -> None:
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
+        "disable_notification": silent,
     }
     try:
         response = requests.post(url, json=payload, timeout=10, impersonate="chrome")
@@ -1379,6 +1386,142 @@ def notify_new_jobs(new_jobs: list[Job]) -> None:
         send_telegram_message(message)
 
 
+# ── Bot commands ─────────────────────────────────────────────────────────────
+
+def _load_telegram_offset() -> int:
+    if not os.path.exists(TELEGRAM_OFFSET_FILE):
+        return 0
+    with open(TELEGRAM_OFFSET_FILE) as f:
+        return json.load(f).get("offset", 0)
+
+
+def _save_telegram_offset(offset: int) -> None:
+    with open(TELEGRAM_OFFSET_FILE, "w") as f:
+        json.dump({"offset": offset}, f)
+
+
+def get_pending_commands() -> list[str]:
+    """
+    Poll getUpdates for any bot messages sent since the last run.
+    Returns a deduplicated list of command strings (e.g. ["/list", "/stats"]).
+    """
+    offset = _load_telegram_offset()
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    try:
+        r = requests.get(url, params={"offset": offset, "timeout": 0}, timeout=10, impersonate="chrome")
+        data = r.json()
+    except Exception as e:
+        print(f"[Telegram] getUpdates failed: {e}")
+        return []
+
+    commands = []
+    max_id = offset
+    for update in data.get("result", []):
+        update_id = update["update_id"]
+        max_id = max(max_id, update_id)
+        text = update.get("message", {}).get("text", "")
+        if text.startswith("/"):
+            cmd = text.split()[0].lower().split("@")[0]  # strip /cmd@botname
+            if cmd not in commands:
+                commands.append(cmd)
+
+    if max_id >= offset:
+        _save_telegram_offset(max_id + 1)
+
+    return commands
+
+
+def send_list(all_jobs: list[Job]) -> None:
+    """Reply to /list with all currently open student roles grouped by company."""
+    if not all_jobs:
+        send_telegram_message("📋 No open student roles found right now.")
+        return
+
+    by_company: dict[str, list[Job]] = {}
+    for job in all_jobs:
+        by_company.setdefault(job.company, []).append(job)
+
+    lines = [f"📋 <b>Open student roles ({len(all_jobs)} total)</b>"]
+    for company, jobs in sorted(by_company.items()):
+        lines.append(f"\n<b>{company}</b>")
+        for job in jobs:
+            lines.append(f"• <a href=\"{job.url}\">{job.title}</a>")
+
+    send_telegram_message("\n".join(lines))
+
+
+def send_stats(all_jobs: list[Job]) -> None:
+    """Reply to /stats with a per-company count of open roles."""
+    if not all_jobs:
+        send_telegram_message("📊 No open student roles found right now.")
+        return
+
+    by_company: dict[str, int] = {}
+    for job in all_jobs:
+        by_company[job.company] = by_company.get(job.company, 0) + 1
+
+    lines = ["📊 <b>Open roles by company</b>\n"]
+    for company, count in sorted(by_company.items(), key=lambda x: -x[1]):
+        lines.append(f"• {company}: {count}")
+    lines.append(f"\n<b>Total: {len(all_jobs)}</b>")
+
+    send_telegram_message("\n".join(lines))
+
+
+# ── Weekly digest ─────────────────────────────────────────────────────────────
+
+def send_weekly_digest(all_jobs: list[Job]) -> None:
+    """Send a silent Sunday morning summary of all currently open roles."""
+    if not all_jobs:
+        send_telegram_message("📋 <b>Weekly digest</b>\n\nNo open student roles this week.", silent=True)
+        return
+
+    by_company: dict[str, list[Job]] = {}
+    for job in all_jobs:
+        by_company.setdefault(job.company, []).append(job)
+
+    lines = [f"📋 <b>Weekly digest — {len(all_jobs)} open role(s)</b>"]
+    for company, jobs in sorted(by_company.items()):
+        lines.append(f"\n<b>{company}</b>")
+        for job in jobs:
+            lines.append(f"• <a href=\"{job.url}\">{job.title}</a>")
+
+    send_telegram_message("\n".join(lines), silent=True)
+
+
+# ── Workday runner heartbeat ──────────────────────────────────────────────────
+
+def save_workday_heartbeat() -> None:
+    """Write a timestamp file so the main job can detect if the runner goes offline."""
+    with open(HEARTBEAT_FILE, "w") as f:
+        json.dump({"timestamp": datetime.utcnow().isoformat()}, f)
+    print(f"[Heartbeat] Saved at {datetime.utcnow().isoformat()} UTC")
+
+
+def check_workday_heartbeat() -> None:
+    """
+    Alert via Telegram if the workday (self-hosted) runner hasn't reported in 26 hours.
+    Called by the main job, which restores the heartbeat file from GitHub Actions cache.
+    """
+    if not os.path.exists(HEARTBEAT_FILE):
+        print("[Heartbeat] No heartbeat file found — workday runner may never have run.")
+        return
+
+    with open(HEARTBEAT_FILE) as f:
+        data = json.load(f)
+
+    last_seen = datetime.fromisoformat(data.get("timestamp", "2000-01-01"))
+    age_hours = (datetime.utcnow() - last_seen).total_seconds() / 3600
+
+    print(f"[Heartbeat] Workday runner last seen {age_hours:.1f}h ago.")
+
+    if age_hours > 26:
+        send_telegram_message(
+            f"⚠️ Workday runner offline — last seen {age_hours:.0f}h ago.\n"
+            "NVIDIA / Intel / Google / Meta have not been checked."
+        )
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def run_all_scrapers() -> list[Job]:
@@ -1431,29 +1574,51 @@ def run_all_scrapers() -> list[Job]:
 
 
 def main():
-    """
-    Entry point — run scrapers, compare against seen jobs, report new ones.
-
-    Flow:
-      1. Load previously seen job IDs from disk.
-      2. Fetch current job postings from all companies.
-      3. Find jobs whose IDs we haven't seen before.
-      4. Print them (notifications will be added here later).
-      5. Save updated seen-jobs list to disk.
-    """
+    """Entry point — run scrapers, report new jobs, handle bot commands and weekly digest."""
     print("Checking for new student job postings...\n")
 
-    seen_ids  = load_seen_jobs()
-    all_jobs  = run_all_scrapers()
+    group = os.getenv("SCRAPER_GROUP", "all")
+    is_main  = group in ("main", "all")
+    is_workday = group in ("workday", "all")
 
-    # Filter to only jobs we haven't reported yet
-    new_jobs  = [j for j in all_jobs if j.job_id not in seen_ids]
+    # Main job: check if the self-hosted runner has reported recently
+    if is_main:
+        check_workday_heartbeat()
 
+    # Main job: pick up any pending /list or /stats commands
+    commands = get_pending_commands() if is_main else []
+    if commands:
+        print(f"[Bot] Pending commands: {commands}")
+
+    seen = load_seen_jobs()
+    all_jobs = run_all_scrapers()
+
+    # Handle bot commands with fresh scrape results
+    if "/list" in commands:
+        send_list(all_jobs)
+    if "/stats" in commands:
+        send_stats(all_jobs)
+
+    # New-job alerts
+    new_jobs = [j for j in all_jobs if j.job_id not in seen]
     notify_new_jobs(new_jobs)
 
-    # Update the seen-jobs file so we don't alert on these again
-    seen_ids.update(j.job_id for j in all_jobs)
-    save_seen_jobs(seen_ids)
+    # Weekly digest — Sunday at 07:00 UTC (≈ 10:00 AM Israel time), main job only
+    now = datetime.utcnow()
+    if is_main and now.weekday() == 6 and now.hour == 7:
+        print("[Digest] Sending weekly digest...")
+        send_weekly_digest(all_jobs)
+
+    # Persist seen jobs (new entries get today's date; old entries keep their date)
+    today = date.today().isoformat()
+    for job in all_jobs:
+        if job.job_id not in seen:
+            seen[job.job_id] = today
+    save_seen_jobs(seen)
+
+    # Workday job: write a heartbeat so the main job knows the runner is alive
+    if is_workday:
+        save_workday_heartbeat()
 
 
 if __name__ == "__main__":

@@ -26,10 +26,20 @@ jobs:
       - name: Restore seen jobs cache
         uses: actions/cache@v4
         with:
-          path: seen_jobs.json
+          path: |
+            seen_jobs.json
+            telegram_offset.json
           key: seen-jobs-main-${{ github.run_id }}
           restore-keys: |
             seen-jobs-main-
+
+      - name: Restore workday heartbeat
+        uses: actions/cache@v4
+        with:
+          path: heartbeat_workday.json
+          key: heartbeat-workday-${{ github.run_id }}
+          restore-keys: |
+            heartbeat-workday-
 
       - name: Run scraper
         env:
@@ -42,7 +52,9 @@ jobs:
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: seen_jobs.json
+          path: |
+            seen_jobs.json
+            telegram_offset.json
           key: seen-jobs-main-${{ github.run_id }}
 
       - name: Notify success
@@ -90,8 +102,16 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SCRAPER_GROUP: workday
-        # seen_jobs_workday.json lives at $HOME on the runner — persists across runs
+        # seen_jobs_workday.json lives at $HOME — persists across git checkouts
+        # heartbeat_workday.json is workspace-relative — saved to cache after each run
         run: SEEN_JOBS_FILE="$HOME/seen_jobs_workday.json" python scraper.py
+
+      - name: Save workday heartbeat to cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: heartbeat_workday.json
+          key: heartbeat-workday-${{ github.run_id }}
 
       - name: Notify success
         if: success()

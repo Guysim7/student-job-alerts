@@ -63,7 +63,9 @@ CS_KEYWORDS = [
 ISRAEL_KEYWORDS = ["israel", "tel aviv", "tel-aviv", "haifa", "jerusalem", "herzliya", "beer sheva", "il,"]
 
 # File that persists job IDs we've already seen across runs.
-SEEN_JOBS_FILE = "seen_jobs.json"
+# On a self-hosted runner, SEEN_JOBS_FILE points to a path outside the
+# workspace so it survives git checkout on each run.
+SEEN_JOBS_FILE = os.getenv("SEEN_JOBS_FILE", "seen_jobs.json")
 
 # Base URL used when building full links to Amazon job listings.
 AMAZON_BASE_URL = "https://www.amazon.jobs"

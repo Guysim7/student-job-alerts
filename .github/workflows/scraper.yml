@@ -9,7 +9,7 @@ on:
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Check out the repo
@@ -23,24 +23,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore seen jobs cache
-        uses: actions/cache@v4
-        with:
-          path: seen_jobs.json
-          # Cache key includes the date so it resets monthly (safety valve)
-          key: seen-jobs-${{ github.run_id }}
-          restore-keys: |
-            seen-jobs-
-
       - name: Run scraper
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python scraper.py
-
-      - name: Save seen jobs cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: seen_jobs.json
-          key: seen-jobs-${{ github.run_id }}
+        # SEEN_JOBS_FILE points outside the workspace so it persists across runs
+        run: SEEN_JOBS_FILE="$HOME/seen_jobs.json" python scraper.py

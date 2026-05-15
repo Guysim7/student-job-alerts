@@ -468,6 +468,47 @@ def fetch_apple_jobs() -> list[Job]:
     return jobs
 
 
+def _find_workday_israel_facet(api_responses: list[dict], label: str) -> str:
+    """
+    Search captured Workday API responses for the Israel location facet ID.
+
+    Workday embeds location facet IDs in the API response's `facets` array.
+    The exact field names vary by Workday version, so we try several variants.
+
+    Returns the facet ID string (a long hex or UUID) if found, else empty string.
+    """
+    import json as _json
+
+    for data in api_responses:
+        for facet in data.get("facets", []):
+            values = facet.get("facetValues") or facet.get("values") or []
+            for entry in values:
+                descriptor = (
+                    entry.get("value", "")
+                    or entry.get("descriptor", "")
+                    or entry.get("label", "")
+                )
+                if "israel" in descriptor.lower():
+                    facet_id = (
+                        entry.get("facetParameter", "")
+                        or entry.get("id", "")
+                        or entry.get("facetValue", "")
+                    )
+                    print(f"[{label}] Found Israel facet: {descriptor!r} → {facet_id!r}")
+                    return facet_id
+
+    # Nothing found — dump a sample so we can adapt if Workday changes its schema
+    for data in api_responses:
+        if data.get("facets"):
+            sample = _json.dumps(data["facets"][:2], indent=2)[:600]
+            print(f"[{label}] Israel facet not found. Facet sample:\n{sample}")
+            break
+    else:
+        print(f"[{label}] No facets returned in API response")
+
+    return ""
+
+
 def _workday_playwright_fetch(
     page_url: str,
     api_url: str,
@@ -478,17 +519,34 @@ def _workday_playwright_fetch(
     """
     Fetch Workday jobs by intercepting the API responses the page makes itself.
 
-    Instead of calling the Workday API directly (which gets rejected by
-    Cloudflare/Workday), we navigate to the search page with ?q=intern and
-    intercept the JSON responses that Workday's own JavaScript fires. The
-    browser's native fetch includes all required cookies and headers automatically.
+    Phase 1 — navigate to ?q=intern and capture the API response to extract
+    the Israel location facet ID from the returned `facets` array.
 
-    Limitation: only captures the first page of results (~20 jobs). Since
-    NVIDIA and Intel post very few Israel intern roles this is sufficient.
+    Phase 2 — navigate to ?q=intern&locations=<israel_facet_id> so Workday's
+    own JavaScript fires a pre-filtered API request returning only Israel jobs.
+    This avoids the 20-result-per-page limit when there are hundreds of global
+    results and only a handful in Israel.
+
+    Falls back to phase 1 results if the Israel facet ID cannot be found.
     """
     from playwright.sync_api import sync_playwright
 
-    captured: list[dict] = []
+    phase = [1]   # mutable reference shared with the closure
+    phase1: list[dict] = []
+    phase2: list[dict] = []
+
+    def _make_handler():
+        def on_response(response):
+            if api_url in response.url and response.status == 200:
+                try:
+                    data = response.json()
+                    if phase[0] == 1:
+                        phase1.append(data)
+                    else:
+                        phase2.append(data)
+                except Exception:
+                    pass
+        return on_response
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -503,16 +561,9 @@ def _workday_playwright_fetch(
         )
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        page.on("response", _make_handler())
 
-        def on_response(response):
-            if api_url in response.url and response.status == 200:
-                try:
-                    captured.append(response.json())
-                except Exception:
-                    pass
-
-        page.on("response", on_response)
-
+        # Phase 1: load the search page to discover facets
         try:
             page.goto(page_url + "?q=intern", wait_until="networkidle", timeout=30000)
         except Exception as e:
@@ -521,15 +572,36 @@ def _workday_playwright_fetch(
             browser.close()
             return []
 
+        israel_facet_id = _find_workday_israel_facet(phase1, label)
+
+        # Phase 2: reload with Israel location filter applied
+        if israel_facet_id:
+            phase[0] = 2
+            try:
+                page.goto(
+                    f"{page_url}?q=intern&locations={israel_facet_id}",
+                    wait_until="networkidle",
+                    timeout=30000,
+                )
+            except Exception as e:
+                print(f"[{label}] Israel-filtered page load failed: {e}")
+
         context.close()
         browser.close()
 
+    # Prefer the Israel-filtered phase 2 results; fall back to phase 1
+    raw_responses = phase2 if (israel_facet_id and phase2) else phase1
+
     raw_jobs: list[dict] = []
-    for resp_data in captured:
+    for resp_data in raw_responses:
         raw_jobs.extend(resp_data.get("jobPostings", []))
 
     if not raw_jobs:
         print(f"[{label}] No API responses captured")
+        return []
+
+    total_api = max((d.get("total", 0) for d in raw_responses), default=0)
+    print(f"[{label}] Captured {len(raw_jobs)} jobs from API (total reported: {total_api})")
 
     jobs = []
     for item in raw_jobs:

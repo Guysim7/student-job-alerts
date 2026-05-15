@@ -512,6 +512,7 @@ def _workday_playwright_fetch(
 
         cookies = context.cookies()
         csrf = next((c["value"] for c in cookies if c["name"] == "CALYPSO_CSRF_TOKEN"), "")
+        print(f"[{label}] Page loaded: {page.url[:60]} | CSRF: {bool(csrf)}")
         headers = {"Content-Type": "application/json"}
         if csrf:
             headers["X-Workday-Client-CSRF-Token"] = csrf

@@ -4,8 +4,8 @@ student-job-alerts scraper
 Fetches student/intern job postings from top tech companies and
 reports any newly seen ones since the last run.
 
-Currently supported companies: Amazon, Microsoft, NVIDIA, Apple, Intel, Check Point, Mobileye, Motorola Solutions, monday.com, CyberArk
-(Requires Playwright: Google, Meta, Cisco, IBM, Qualcomm)
+Currently supported companies: Amazon, Microsoft, NVIDIA, Apple, Intel, Check Point, Mobileye, Motorola Solutions, monday.com, CyberArk, Google, Meta
+(Requires Playwright for: NVIDIA, Intel, Google, Meta; others: Cisco, IBM, Qualcomm)
 
 How it works:
   1. Each company has its own fetch function that returns a list of Job objects.
@@ -961,6 +961,286 @@ def fetch_nvidia_jobs() -> list[Job]:
     )
 
 
+def fetch_google_jobs() -> list[Job]:
+    """
+    Fetch Google intern jobs in Israel using Playwright response interception.
+
+    Google's careers site is fully client-side rendered and uses a batchexecute
+    RPC mechanism that requires XSRF tokens and session cookies — impossible to
+    replicate with curl. Instead, we navigate to the pre-filtered URL and
+    intercept the XHR responses that the page fires itself.
+
+    The pre-filtered URL restricts results to Israel + INTERN employment type,
+    so the first page of results is already scoped to what we want.
+    """
+    from playwright.sync_api import sync_playwright
+    import json as _json
+    import re as _re
+
+    GOOGLE_PAGE_URL  = "https://careers.google.com/jobs/results/?q=intern&location=Israel&employment_type=INTERN"
+    GOOGLE_BASE_URL  = "https://careers.google.com"
+    GOOGLE_XHR_HINT  = "careers.google.com"   # filter for responses from this domain
+
+    captured: list[tuple[str, str]] = []   # (url, text)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        def on_response(response):
+            url = response.url
+            if GOOGLE_XHR_HINT in url and response.status == 200:
+                ct = response.headers.get("content-type", "")
+                if "json" in ct or "batchexecute" in url or "/_/" in url:
+                    try:
+                        text = response.text()
+                        if len(text) > 100:
+                            captured.append((url, text))
+                    except Exception:
+                        pass
+
+        page.on("response", on_response)
+
+        try:
+            page.goto(GOOGLE_PAGE_URL, wait_until="networkidle", timeout=30000)
+        except Exception as e:
+            print(f"[Google] Page load failed: {e}")
+            context.close()
+            browser.close()
+            return []
+
+        context.close()
+        browser.close()
+
+    if not captured:
+        print("[Google] No XHR responses captured")
+        return []
+
+    print(f"[Google] Captured {len(captured)} responses")
+
+    jobs = []
+    for url, text in captured:
+        print(f"[Google] Response from {url[:100]} ({len(text)} bytes)")
+
+        # Google batchexecute responses start with )]}'\n — strip and parse
+        clean = text
+        if clean.startswith(")]}'"):
+            clean = clean[4:].lstrip("\n")
+
+        try:
+            outer = _json.loads(clean)
+        except Exception:
+            # Sometimes it's a chunked stream — try to find the JSON array
+            m = _re.search(r'(\[\[.*\]\])', clean, _re.DOTALL)
+            if not m:
+                print(f"[Google] Could not parse response from {url[:80]}")
+                continue
+            try:
+                outer = _json.loads(m.group(1))
+            except Exception as e:
+                print(f"[Google] Parse failed: {e}")
+                continue
+
+        # Walk the nested structure to find job arrays
+        # batchexecute wraps: [[["rpcid", "json_string", null, null]]]
+        raw_job_data = None
+        def find_job_list(node, depth=0):
+            nonlocal raw_job_data
+            if depth > 6 or raw_job_data is not None:
+                return
+            if isinstance(node, list):
+                for item in node:
+                    find_job_list(item, depth + 1)
+            elif isinstance(node, str) and len(node) > 200:
+                try:
+                    parsed = _json.loads(node)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        # Check if it looks like a list of job objects
+                        first = parsed[0] if parsed else None
+                        if isinstance(first, list) and len(first) > 5:
+                            raw_job_data = parsed
+                except Exception:
+                    pass
+
+        find_job_list(outer)
+
+        if raw_job_data is None:
+            print(f"[Google] Could not locate job list in response. Sample: {repr(text[:300])}")
+            continue
+
+        print(f"[Google] Found {len(raw_job_data)} raw job entries")
+
+        for entry in raw_job_data:
+            if not isinstance(entry, list) or len(entry) < 10:
+                continue
+            # Google job array fields (positional, may shift — log if parsing fails)
+            try:
+                title    = entry[0] if isinstance(entry[0], str) else ""
+                location = entry[2] if isinstance(entry[2], str) else ""
+                dates    = entry[7] if isinstance(entry[7], list) else []
+                job_key  = entry[9] if isinstance(entry[9], str) else ""
+                url_path = next((x for x in entry if isinstance(x, str) and x.startswith("/jobs/results/")), "")
+                url      = GOOGLE_BASE_URL + url_path if url_path else ""
+                posted   = dates[0] if dates else ""
+            except Exception as e:
+                print(f"[Google] Entry parse error: {e} — entry[:5]={entry[:5]}")
+                continue
+
+            job = Job(
+                job_id   = f"google_{job_key}",
+                title    = title,
+                company  = "Google",
+                location = location,
+                url      = url,
+                posted   = posted,
+            )
+            if job.is_student_role() and job.is_in_israel() and job.is_bsc_level():
+                jobs.append(job)
+
+    return jobs
+
+
+def fetch_meta_jobs() -> list[Job]:
+    """
+    Fetch Meta intern jobs in Israel using Playwright response interception.
+
+    Meta's careers site uses a Relay/GraphQL API that requires DTSGInitialData
+    and LSD tokens obtained from the page — impossible to call directly. We
+    navigate to the pre-filtered URL and intercept the GraphQL response that
+    the page fires during load.
+    """
+    from playwright.sync_api import sync_playwright
+    import json as _json
+
+    META_PAGE_URL = "https://www.metacareers.com/jobs?q=intern&offices[0]=Israel"
+    META_GQL_HINT = "metacareers.com"
+
+    captured: list[tuple[str, str]] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+            )
+        )
+        page = context.new_page()
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+
+        def on_response(response):
+            url = response.url
+            if META_GQL_HINT in url and response.status == 200:
+                ct = response.headers.get("content-type", "")
+                if "json" in ct or "graphql" in url or "/api/" in url:
+                    try:
+                        text = response.text()
+                        if "title" in text.lower() and len(text) > 200:
+                            captured.append((url, text))
+                    except Exception:
+                        pass
+
+        page.on("response", on_response)
+
+        try:
+            page.goto(META_PAGE_URL, wait_until="networkidle", timeout=30000)
+        except Exception as e:
+            print(f"[Meta] Page load failed: {e}")
+            context.close()
+            browser.close()
+            return []
+
+        context.close()
+        browser.close()
+
+    if not captured:
+        print("[Meta] No API responses captured")
+        return []
+
+    print(f"[Meta] Captured {len(captured)} responses")
+
+    jobs = []
+    for url, text in captured:
+        print(f"[Meta] Response from {url[:100]} ({len(text)} bytes)")
+
+        try:
+            data = _json.loads(text)
+        except Exception as e:
+            print(f"[Meta] JSON parse failed: {e}. Sample: {repr(text[:200])}")
+            continue
+
+        # Navigate the GraphQL response structure
+        # Expected: data.job_search.results or data.data.job_search.results
+        search = (
+            data.get("data", {}).get("job_search", {})
+            or data.get("job_search", {})
+        )
+        results = search.get("results") or search.get("jobs") or []
+
+        if not results:
+            # Try to find any list with job-like objects
+            def find_results(node, depth=0):
+                if depth > 5:
+                    return []
+                if isinstance(node, list) and node and isinstance(node[0], dict) and "title" in node[0]:
+                    return node
+                if isinstance(node, dict):
+                    for v in node.values():
+                        found = find_results(v, depth + 1)
+                        if found:
+                            return found
+                return []
+            results = find_results(data)
+
+        if not results:
+            print(f"[Meta] Could not locate job list. Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            continue
+
+        print(f"[Meta] Found {len(results)} raw job entries")
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+
+            title    = item.get("title", "")
+            location = (
+                item.get("location", "")
+                or item.get("locations", [""])[0]
+                or item.get("city", "")
+            )
+            if isinstance(location, dict):
+                location = location.get("name", "") or location.get("city", "")
+            job_id   = str(item.get("id", "") or item.get("req_id", ""))
+            url      = item.get("url", "") or f"https://www.metacareers.com/jobs/{job_id}"
+            posted   = item.get("created_time", "") or item.get("posted_date", "")
+
+            job = Job(
+                job_id   = f"meta_{job_id}",
+                title    = title,
+                company  = "Meta",
+                location = location,
+                url      = url,
+                posted   = str(posted),
+            )
+            if job.is_student_role() and job.is_in_israel() and job.is_bsc_level():
+                jobs.append(job)
+
+    return jobs
+
+
 # ── Persistence (seen-jobs tracking) ─────────────────────────────────────────
 
 def load_seen_jobs() -> set[str]:
@@ -1107,7 +1387,7 @@ def run_all_scrapers() -> list[Job]:
 
     SCRAPER_GROUP env var controls which subset runs:
       main    → curl_cffi scrapers (run on ubuntu-latest, no PC needed)
-      workday → Playwright scrapers (run on self-hosted runner, needs PC)
+      workday → Playwright scrapers: NVIDIA, Intel, Google, Meta (run on self-hosted runner, needs PC)
       unset   → all scrapers
     """
     group = os.getenv("SCRAPER_GROUP", "all")
@@ -1126,6 +1406,8 @@ def run_all_scrapers() -> list[Job]:
     workday_scrapers = [
         fetch_nvidia_jobs,
         fetch_intel_jobs,
+        fetch_google_jobs,
+        fetch_meta_jobs,
     ]
 
     if group == "main":

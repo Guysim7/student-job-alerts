@@ -46,7 +46,7 @@ jobs:
           key: seen-jobs-main-${{ github.run_id }}
 
   # Runs on your PC — only when it's on.
-  # Handles: NVIDIA, Intel (need Playwright to bypass Cloudflare)
+  # Handles: NVIDIA, Intel, Google, Meta (need Playwright)
   scrape-workday:
     runs-on: self-hosted
     steps:

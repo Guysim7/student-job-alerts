@@ -468,68 +468,65 @@ def fetch_apple_jobs() -> list[Job]:
     return jobs
 
 
-def _intel_session() -> tuple:
-    """Open a Workday session for Intel and return (session, post_headers)."""
-    session = requests.Session(impersonate="chrome136")
-    try:
-        session.get("https://intel.wd1.myworkdayjobs.com/External", timeout=15)
-    except Exception as e:
-        print(f"[Intel] Session init failed: {e}")
-    time.sleep(8)
-    csrf = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
-    headers = {"Content-Type": "application/json"}
-    if csrf:
-        headers["X-Workday-Client-CSRF-Token"] = csrf
-    return session, headers
-
-
-def fetch_intel_jobs() -> list[Job]:
+def _workday_playwright_fetch(
+    page_url: str,
+    api_url: str,
+    base_url: str,
+    label: str,
+    id_prefix: str,
+) -> list[Job]:
     """
-    Fetch student / intern job postings from Intel's Workday career portal.
+    Fetch Workday jobs using a real Chromium browser to bypass Cloudflare.
 
-    Intel uses the same Workday platform as NVIDIA. A session is used to avoid
-    intermittent 400s from Cloudflare. Israel filtering is done client-side.
-    Intel has ~400–500 intern results total; we paginate at 100 per page.
-
-    Returns:
-        A list of Job objects for student roles located in Israel.
+    curl_cffi mimics the TLS fingerprint but can't execute Cloudflare's JS
+    challenge. Playwright runs real Chromium, so the challenge is solved
+    automatically. After the page loads we use the established browser session
+    (cookies + CSRF token) to call the JSON API directly.
     """
-    session, post_headers = _intel_session()
+    from playwright.sync_api import sync_playwright
+
     raw_jobs: list[dict] = []
-    offset, limit = 0, 100
 
-    while True:
-        payload = {"limit": limit, "offset": offset, "searchText": "intern", "appliedFacets": {}}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+
         try:
-            response = session.post(INTEL_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
+            page.goto(page_url, wait_until="networkidle", timeout=30000)
         except Exception as e:
-            print(f"[Intel] Request failed: {e}")
-            break
+            print(f"[{label}] Page load failed: {e}")
+            browser.close()
+            return []
 
-        if response.status_code == 400 and offset == 0:
-            print("[Intel] Got 400, retrying with new session…")
-            time.sleep(5)
-            session, post_headers = _intel_session()
+        cookies = page.context.cookies()
+        csrf = next((c["value"] for c in cookies if c["name"] == "CALYPSO_CSRF_TOKEN"), "")
+        headers = {"Content-Type": "application/json"}
+        if csrf:
+            headers["X-Workday-Client-CSRF-Token"] = csrf
+
+        offset, limit = 0, 100
+        while True:
+            payload = json.dumps({"limit": limit, "offset": offset, "searchText": "intern", "appliedFacets": {}})
             try:
-                response = session.post(INTEL_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
+                resp = page.request.post(api_url, data=payload, headers=headers)
+                if resp.status != 200:
+                    print(f"[{label}] API returned {resp.status}")
+                    break
+                data = resp.json()
             except Exception as e:
-                print(f"[Intel] Retry failed: {e}")
+                print(f"[{label}] API request failed: {e}")
                 break
 
-        if response.status_code != 200:
-            print(f"[Intel] Request failed: HTTP {response.status_code}")
-            break
+            page_jobs = data.get("jobPostings", [])
+            total = data.get("total", 0)
+            if not page_jobs:
+                break
+            raw_jobs.extend(page_jobs)
+            offset += len(page_jobs)
+            if offset >= total:
+                break
 
-        data  = response.json()
-        total = data.get("total", 0)
-        page  = data.get("jobPostings", [])
-        if not page:
-            break
-        raw_jobs.extend(page)
-        offset += len(page)
-        if offset >= total:
-            break
-        time.sleep(0.5)
+        browser.close()
 
     jobs = []
     for item in raw_jobs:
@@ -539,17 +536,28 @@ def fetch_intel_jobs() -> list[Job]:
 
         job_id = item.get("bulletFields", [""])[0] or item.get("externalPath", "")
         job = Job(
-            job_id   = f"intel_{job_id}",
+            job_id   = f"{id_prefix}_{job_id}",
             title    = item.get("title", ""),
-            company  = "Intel",
+            company  = label,
             location = loc,
-            url      = INTEL_WORKDAY_BASE_URL + item.get("externalPath", ""),
+            url      = base_url + item.get("externalPath", ""),
             posted   = item.get("postedOn", ""),
         )
         if job.is_student_role() and job.is_bsc_level():
             jobs.append(job)
 
     return jobs
+
+
+def fetch_intel_jobs() -> list[Job]:
+    """Fetch Intel intern jobs from Workday using Playwright to bypass Cloudflare."""
+    return _workday_playwright_fetch(
+        page_url  = "https://intel.wd1.myworkdayjobs.com/External",
+        api_url   = INTEL_WORKDAY_URL,
+        base_url  = INTEL_WORKDAY_BASE_URL,
+        label     = "Intel",
+        id_prefix = "intel",
+    )
 
 
 def fetch_checkpoint_jobs() -> list[Job]:
@@ -676,114 +684,15 @@ def fetch_mobileye_jobs() -> list[Job]:
     return jobs
 
 
-def _nvidia_session() -> tuple | None:
-    """
-    Open a fresh Workday session and return (session, post_headers).
-
-    Workday requires a real browser session before accepting API calls:
-    the GET sets CALYPSO_SESSION + CALYPSO_CSRF_TOKEN cookies; the CSRF
-    token must also be sent as a request header.  Returns None on failure.
-    """
-    session = requests.Session(impersonate="chrome136")
-    try:
-        session.get("https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite", timeout=15)
-    except Exception as e:
-        print(f"[NVIDIA] Session init failed: {e}")
-        return None
-    time.sleep(8)
-    csrf = session.cookies.get("CALYPSO_CSRF_TOKEN", "")
-    headers = {"Content-Type": "application/json"}
-    if csrf:
-        headers["X-Workday-Client-CSRF-Token"] = csrf
-    return session, headers
-
-
 def fetch_nvidia_jobs() -> list[Job]:
-    """
-    Fetch student / intern job postings from NVIDIA's Workday career portal.
-
-    Strategy:
-      - The location facet (locationHierarchy1) causes intermittent 400s, so we
-        skip it and instead paginate through all 'intern' results (typically ~900),
-        filtering for Israel on our side.
-      - On a 400 we retry once with a brand-new session before giving up.
-
-    The 'postedOn' field uses Workday's relative format ('Posted 3 Days Ago')
-    which is handled by Job.age_in_days().
-
-    Returns:
-        A list of Job objects for student roles located in Israel.
-    """
-    sess_data = _nvidia_session()
-    if sess_data is None:
-        return []
-    session, post_headers = sess_data
-
-    raw_jobs: list[dict] = []
-    offset = 0
-    limit  = 100
-
-    while True:
-        payload = {
-            "limit": limit,
-            "offset": offset,
-            "searchText": "intern",
-            "appliedFacets": {},
-        }
-        try:
-            response = session.post(NVIDIA_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
-        except Exception as e:
-            print(f"[NVIDIA] Request failed: {e}")
-            break
-
-        if response.status_code == 400 and offset == 0:
-            # Cloudflare rejected our session — back off, then retry with a fresh one
-            print("[NVIDIA] Got 400, retrying with new session…")
-            time.sleep(5)
-            sess_data = _nvidia_session()
-            if sess_data is None:
-                break
-            session, post_headers = sess_data
-            try:
-                response = session.post(NVIDIA_WORKDAY_URL, json=payload, headers=post_headers, timeout=15)
-            except Exception as e:
-                print(f"[NVIDIA] Retry failed: {e}")
-                break
-
-        if response.status_code != 200:
-            print(f"[NVIDIA] Request failed: HTTP {response.status_code}")
-            break
-
-        data  = response.json()
-        total = data.get("total", 0)
-        page  = data.get("jobPostings", [])
-        if not page:
-            break
-        raw_jobs.extend(page)
-        offset += len(page)
-        if offset >= total:
-            break
-        time.sleep(0.5)
-
-    jobs = []
-    for item in raw_jobs:
-        loc = item.get("locationsText", "")
-        if not any(kw in loc.lower() for kw in ISRAEL_KEYWORDS):
-            continue
-
-        job_id = item.get("bulletFields", [""])[0] or item.get("externalPath", "")
-        job = Job(
-            job_id   = f"nvidia_{job_id}",
-            title    = item.get("title", ""),
-            company  = "NVIDIA",
-            location = loc,
-            url      = NVIDIA_WORKDAY_BASE_URL + item.get("externalPath", ""),
-            posted   = item.get("postedOn", ""),
-        )
-        if job.is_student_role() and job.is_bsc_level():
-            jobs.append(job)
-
-    return jobs
+    """Fetch NVIDIA intern jobs from Workday using Playwright to bypass Cloudflare."""
+    return _workday_playwright_fetch(
+        page_url  = "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite",
+        api_url   = NVIDIA_WORKDAY_URL,
+        base_url  = NVIDIA_WORKDAY_BASE_URL,
+        label     = "NVIDIA",
+        id_prefix = "nvidia",
+    )
 
 
 # ── Persistence (seen-jobs tracking) ─────────────────────────────────────────

@@ -512,25 +512,25 @@ def _workday_playwright_fetch(
 
         cookies = context.cookies()
         csrf = next((c["value"] for c in cookies if c["name"] == "CALYPSO_CSRF_TOKEN"), "")
-        # page.request has an isolated cookie jar — manually forward all browser
-        # cookies (CALYPSO_SESSION, __cf_bm, etc.) so Workday accepts the request.
-        cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-        headers = {
-            "Content-Type": "application/json",
-            "Cookie": cookie_header,
-        }
-        if csrf:
-            headers["X-Workday-Client-CSRF-Token"] = csrf
 
         offset, limit = 0, 100
         while True:
-            payload = json.dumps({"limit": limit, "offset": offset, "searchText": "intern", "appliedFacets": {}})
             try:
-                resp = page.request.post(api_url, data=payload, headers=headers)
-                if resp.status != 200:
-                    print(f"[{label}] API returned {resp.status}: {resp.text()[:120]}")
+                # Use page.evaluate() so the fetch runs inside the browser —
+                # this sends all session cookies and Origin/Referer headers
+                # automatically, exactly like a real XHR from the Workday page.
+                result = page.evaluate("""
+                    async ([url, csrf, body]) => {
+                        const headers = {'Content-Type': 'application/json'};
+                        if (csrf) headers['X-Workday-Client-CSRF-Token'] = csrf;
+                        const r = await fetch(url, {method: 'POST', headers, body});
+                        return {status: r.status, data: await r.json()};
+                    }
+                """, [api_url, csrf, json.dumps({"limit": limit, "offset": offset, "searchText": "intern", "appliedFacets": {}})])
+                if result["status"] != 200:
+                    print(f"[{label}] API returned {result['status']}")
                     break
-                data = resp.json()
+                data = result["data"]
             except Exception as e:
                 print(f"[{label}] API request failed: {e}")
                 break

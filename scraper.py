@@ -476,16 +476,19 @@ def _workday_playwright_fetch(
     id_prefix: str,
 ) -> list[Job]:
     """
-    Fetch Workday jobs using a real Chromium browser to bypass Cloudflare.
+    Fetch Workday jobs by intercepting the API responses the page makes itself.
 
-    curl_cffi mimics the TLS fingerprint but can't execute Cloudflare's JS
-    challenge. Playwright runs real Chromium, so the challenge is solved
-    automatically. After the page loads we use the established browser session
-    (cookies + CSRF token) to call the JSON API directly.
+    Instead of calling the Workday API directly (which gets rejected by
+    Cloudflare/Workday), we navigate to the search page with ?q=intern and
+    intercept the JSON responses that Workday's own JavaScript fires. The
+    browser's native fetch includes all required cookies and headers automatically.
+
+    Limitation: only captures the first page of results (~20 jobs). Since
+    NVIDIA and Intel post very few Israel intern roles this is sufficient.
     """
     from playwright.sync_api import sync_playwright
 
-    raw_jobs: list[dict] = []
+    captured: list[dict] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -499,53 +502,34 @@ def _workday_playwright_fetch(
             )
         )
         page = context.new_page()
-        # Hide the navigator.webdriver flag that Cloudflare checks for headless bots
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
 
+        def on_response(response):
+            if api_url in response.url and response.status == 200:
+                try:
+                    captured.append(response.json())
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+
         try:
-            page.goto(page_url, wait_until="networkidle", timeout=30000)
+            page.goto(page_url + "?q=intern", wait_until="networkidle", timeout=30000)
         except Exception as e:
             print(f"[{label}] Page load failed: {e}")
             context.close()
             browser.close()
             return []
 
-        cookies = context.cookies()
-        csrf = next((c["value"] for c in cookies if c["name"] == "CALYPSO_CSRF_TOKEN"), "")
-
-        offset, limit = 0, 100
-        while True:
-            try:
-                # Use page.evaluate() so the fetch runs inside the browser —
-                # this sends all session cookies and Origin/Referer headers
-                # automatically, exactly like a real XHR from the Workday page.
-                result = page.evaluate("""
-                    async ([url, csrf, body]) => {
-                        const headers = {'Content-Type': 'application/json'};
-                        if (csrf) headers['X-Workday-Client-CSRF-Token'] = csrf;
-                        const r = await fetch(url, {method: 'POST', headers, body});
-                        return {status: r.status, data: await r.json()};
-                    }
-                """, [api_url, csrf, json.dumps({"limit": limit, "offset": offset, "searchText": "intern", "appliedFacets": {}})])
-                if result["status"] != 200:
-                    print(f"[{label}] API returned {result['status']}")
-                    break
-                data = result["data"]
-            except Exception as e:
-                print(f"[{label}] API request failed: {e}")
-                break
-
-            page_jobs = data.get("jobPostings", [])
-            total = data.get("total", 0)
-            if not page_jobs:
-                break
-            raw_jobs.extend(page_jobs)
-            offset += len(page_jobs)
-            if offset >= total:
-                break
-
         context.close()
         browser.close()
+
+    raw_jobs: list[dict] = []
+    for resp_data in captured:
+        raw_jobs.extend(resp_data.get("jobPostings", []))
+
+    if not raw_jobs:
+        print(f"[{label}] No API responses captured")
 
     jobs = []
     for item in raw_jobs:

@@ -68,6 +68,7 @@ ISRAEL_KEYWORDS = ["israel", "tel aviv", "tel-aviv", "haifa", "jerusalem", "herz
 SEEN_JOBS_FILE        = os.getenv("SEEN_JOBS_FILE", "seen_jobs.json")
 SEEN_JOBS_EXPIRY_DAYS = 90   # drop entries older than this from seen_jobs.json
 TELEGRAM_OFFSET_FILE  = os.getenv("TELEGRAM_OFFSET_FILE", "telegram_offset.json")
+NOTIFY_SETTINGS_FILE  = os.getenv("NOTIFY_SETTINGS_FILE", "notify_settings.json")
 HEARTBEAT_FILE        = os.getenv("HEARTBEAT_FILE", "heartbeat_workday.json")
 
 # Base URL used when building full links to Amazon job listings.
@@ -1407,6 +1408,18 @@ def _save_telegram_offset(offset: int) -> None:
         json.dump({"offset": offset}, f)
 
 
+def _load_notify_settings() -> dict:
+    if not os.path.exists(NOTIFY_SETTINGS_FILE):
+        return {"notify_success": True}
+    with open(NOTIFY_SETTINGS_FILE) as f:
+        return json.load(f)
+
+
+def _save_notify_settings(settings: dict) -> None:
+    with open(NOTIFY_SETTINGS_FILE, "w") as f:
+        json.dump(settings, f)
+
+
 def get_pending_commands() -> list[str]:
     """
     Poll getUpdates for any bot messages sent since the last run.
@@ -1601,10 +1614,21 @@ def main():
     all_jobs = run_all_scrapers()
 
     # Handle bot commands with fresh scrape results
+    notify_settings = _load_notify_settings() if is_main else {}
     if "/list" in commands:
         send_list(all_jobs)
     if "/stats" in commands:
         send_stats(all_jobs)
+    if "/mute" in commands:
+        notify_settings["notify_success"] = False
+        _save_notify_settings(notify_settings)
+        send_telegram_message("🔕 Success notifications muted. Send /unmute to re-enable.")
+        print("[Bot] Success notifications muted.")
+    if "/unmute" in commands:
+        notify_settings["notify_success"] = True
+        _save_notify_settings(notify_settings)
+        send_telegram_message("🔔 Success notifications enabled.")
+        print("[Bot] Success notifications unmuted.")
 
     # New-job alerts
     new_jobs = [j for j in all_jobs if j.job_id not in seen]
@@ -1622,6 +1646,10 @@ def main():
         if job.job_id not in seen:
             seen[job.job_id] = today
     save_seen_jobs(seen)
+
+    # Silent success ping (main job only, if not muted)
+    if is_main and notify_settings.get("notify_success", True):
+        send_telegram_message("✅ Main scraper ran successfully", silent=True)
 
     # Workday job: write a heartbeat so the main job knows the runner is alive
     if is_workday:

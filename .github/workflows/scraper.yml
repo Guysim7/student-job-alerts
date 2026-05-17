@@ -29,6 +29,7 @@ jobs:
           path: |
             seen_jobs.json
             telegram_offset.json
+            notify_settings.json
           key: seen-jobs-main-${{ github.run_id }}
           restore-keys: |
             seen-jobs-main-
@@ -55,18 +56,8 @@ jobs:
           path: |
             seen_jobs.json
             telegram_offset.json
+            notify_settings.json
           key: seen-jobs-main-${{ github.run_id }}
-
-      - name: Notify success
-        if: success()
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT_ID" \
-            -d text="✅ Main scraper ran successfully" \
-            -d disable_notification=true
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Notify failure
         if: failure()
@@ -112,17 +103,6 @@ jobs:
         with:
           path: heartbeat_workday.json
           key: heartbeat-workday-${{ github.run_id }}
-
-      - name: Notify success
-        if: success()
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
-            -d chat_id="$TELEGRAM_CHAT_ID" \
-            -d text="✅ Workday scraper ran successfully" \
-            -d disable_notification=true
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
       - name: Notify failure
         if: failure()

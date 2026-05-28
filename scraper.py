@@ -36,7 +36,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # ── Configuration ────────────────────────────────────────────────────────────
 
 # Keywords used to filter job titles for student-relevant roles.
-STUDENT_KEYWORDS = ["intern", "internship", "new grad", "entry level", "student"]
+STUDENT_KEYWORDS = ["intern", "internship", "new grad", "entry level", "student", "graduate", "co-op", "coop"]
 
 # Jobs whose titles contain any of these are excluded — they target PhD/MSc candidates,
 # not BSc students.
@@ -553,17 +553,28 @@ def _workday_playwright_fetch(
     phase1: list[dict] = []
     phase2: list[dict] = []
 
+    # Extract the domain (e.g. "nvidia.wd5.myworkdayjobs.com") for loose matching
+    # in case Workday changes the /wday/cxs/ path in the future.
+    from urllib.parse import urlparse as _urlparse
+    api_domain = _urlparse(api_url).netloc  # e.g. "nvidia.wd5.myworkdayjobs.com"
+    unmatched_workday_urls: list[str] = []
+
     def _make_handler():
         def on_response(response):
-            if api_url in response.url and response.status == 200:
-                try:
-                    data = response.json()
-                    if phase[0] == 1:
-                        phase1.append(data)
-                    else:
-                        phase2.append(data)
-                except Exception:
-                    pass
+            url = response.url
+            if response.status == 200:
+                if api_url in url:
+                    try:
+                        data = response.json()
+                        if phase[0] == 1:
+                            phase1.append(data)
+                        else:
+                            phase2.append(data)
+                    except Exception:
+                        pass
+                elif api_domain in url and "/wday/" in url and url not in unmatched_workday_urls:
+                    # Capture near-miss Workday API URLs for diagnostics
+                    unmatched_workday_urls.append(url)
         return on_response
 
     with sync_playwright() as p:
@@ -581,23 +592,29 @@ def _workday_playwright_fetch(
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page.on("response", _make_handler())
 
-        # Phase 1: load the search page to discover facets
+        # Phase 1: load the search page with no keyword filter so all job categories
+        # (intern, graduate, co-op, student) appear in the facets.
         try:
-            page.goto(page_url + "?q=intern", wait_until="networkidle", timeout=30000)
+            page.goto(page_url, wait_until="networkidle", timeout=30000)
         except Exception as e:
             print(f"[{label}] Page load failed: {e}")
             context.close()
             browser.close()
             return []
 
+        if not phase1 and unmatched_workday_urls:
+            print(f"[{label}] WARNING: API URL may have changed. Expected: {api_url}")
+            print(f"[{label}] Observed Workday URLs: {unmatched_workday_urls[:3]}")
+
         israel_facet_id = _find_workday_israel_facet(phase1, label)
 
-        # Phase 2: reload with Israel location filter applied
+        # Phase 2: reload with only the Israel location filter — no keyword query so
+        # graduate/co-op/student roles aren't excluded at the search level.
         if israel_facet_id:
             phase[0] = 2
             try:
                 page.goto(
-                    f"{page_url}?q=intern&locations={israel_facet_id}",
+                    f"{page_url}?locations={israel_facet_id}",
                     wait_until="networkidle",
                     timeout=30000,
                 )
@@ -1518,7 +1535,7 @@ def save_workday_heartbeat() -> None:
     print(f"[Heartbeat] Saved at {datetime.utcnow().isoformat()} UTC")
 
 
-def check_workday_heartbeat() -> None:
+def check_workday_heartbeat(muted: bool = False) -> None:
     """
     Alert via Telegram if the workday (self-hosted) runner hasn't reported in 26 hours.
     Called by the main job, which restores the heartbeat file from GitHub Actions cache.
@@ -1536,6 +1553,9 @@ def check_workday_heartbeat() -> None:
     print(f"[Heartbeat] Workday runner last seen {age_hours:.1f}h ago.")
 
     if age_hours > 26:
+        if muted:
+            print("[Heartbeat] Runner offline but notifications are muted — skipping alert.")
+            return
         send_telegram_message(
             f"⚠️ Workday runner offline — last seen {age_hours:.0f}h ago.\n"
             "NVIDIA / Intel / Google / Meta have not been checked."
@@ -1601,24 +1621,14 @@ def main():
     is_main  = group in ("main", "all")
     is_workday = group in ("workday", "all")
 
-    # Main job: check if the self-hosted runner has reported recently
-    if is_main:
-        check_workday_heartbeat()
-
     # Main job: pick up any pending /list or /stats commands
     commands = get_pending_commands() if is_main else []
     if commands:
         print(f"[Bot] Pending commands: {commands}")
 
-    seen = load_seen_jobs()
-    all_jobs = run_all_scrapers()
-
-    # Handle bot commands with fresh scrape results
     notify_settings = _load_notify_settings() if is_main else {}
-    if "/list" in commands:
-        send_list(all_jobs)
-    if "/stats" in commands:
-        send_stats(all_jobs)
+
+    # Handle mute/unmute early so heartbeat check respects the new state
     if "/mute" in commands:
         notify_settings["notify_success"] = False
         _save_notify_settings(notify_settings)
@@ -1629,6 +1639,23 @@ def main():
         _save_notify_settings(notify_settings)
         send_telegram_message("🔔 Success notifications enabled.")
         print("[Bot] Success notifications unmuted.")
+
+    # Workday job: write heartbeat immediately so "PC online" means runner started,
+    # not just that all scrapers completed without error.
+    if is_workday:
+        save_workday_heartbeat()
+
+    # Main job: check if the self-hosted runner has reported recently
+    if is_main:
+        muted = not notify_settings.get("notify_success", True)
+        check_workday_heartbeat(muted=muted)
+
+    seen = load_seen_jobs()
+    all_jobs = run_all_scrapers()
+    if "/list" in commands:
+        send_list(all_jobs)
+    if "/stats" in commands:
+        send_stats(all_jobs)
 
     # New-job alerts
     new_jobs = [j for j in all_jobs if j.job_id not in seen]
@@ -1650,10 +1677,6 @@ def main():
     # Silent success ping (main job only, if not muted)
     if is_main and notify_settings.get("notify_success", True):
         send_telegram_message("✅ Main scraper ran successfully", silent=True)
-
-    # Workday job: write a heartbeat so the main job knows the runner is alive
-    if is_workday:
-        save_workday_heartbeat()
 
 
 if __name__ == "__main__":
